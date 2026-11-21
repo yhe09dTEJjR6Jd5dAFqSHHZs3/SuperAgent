@@ -26,13 +26,13 @@ import zipfile
 import zlib
 from collections import OrderedDict, deque
 
-W, H, GW, GH, FEATURE_COUNT = 320, 180, 20, 12, 528
-MODEL_FORMAT, MODEL_HIDDEN_SIZE = 21, 128
+W, H, GW, GH, FEATURE_COUNT = 320, 180, 20, 12, 544
+MODEL_FORMAT, MODEL_HIDDEN_SIZE = 24, 128
 SOURCE_BUILD = hashlib.sha256(pathlib.Path(__file__).resolve().read_bytes()).hexdigest()[:20]
 AGENT_DATA_DIR = f'WindowsGameAgent-data-{SOURCE_BUILD}'
 DETAIL_SCHEMA_START, DETAIL_META_START, GOAL_VALUE_FEATURES = 150, 154, 48
 SEMANTIC_START, SEMANTIC_COUNT, WORLD_VISUAL_COUNT = 448, 64, 96
-VISUAL_LATENT_START, VISUAL_LATENT_COUNT = 512, 16
+VISUAL_LATENT_START, VISUAL_LATENT_COUNT, VISUAL_SOURCE_COUNT = 512, 32, 416
 WORLD_SEMANTIC_SLOTS = tuple(range(12)) + tuple(range(24, 40)) + tuple(range(56, 60))
 RECONSTRUCTION_INDICES = tuple(dict.fromkeys(tuple(range(1, 10)) + tuple(18 + 7 * i for i in range(12)) + tuple(range(SEMANTIC_START, SEMANTIC_START + 8)) + tuple(range(18, 102, 7)) + tuple(range(20, 102, 7)) + tuple(range(SEMANTIC_START + 8, SEMANTIC_START + 16)) + tuple(range(SEMANTIC_START + 24, SEMANTIC_START + 56)) + tuple(range(SEMANTIC_START + 56, SEMANTIC_START + 60))))
 DW, DH = 960, 540
@@ -112,6 +112,69 @@ def supported_goal_training(transition):
     elif tier == 'calibrated_proxy':
         reliability *= 0.65
     return max(-1.0, min(1.0, signal)), min(1.0, reliability)
+
+def temporal_response_confidence(frame_deltas, interval_deltas, passive, stability):
+    clean = [max(0.0, float(value)) for value in frame_deltas
+             if isinstance(value, (int, float)) and math.isfinite(value)]
+    if len(clean) < 2:
+        return 0.50
+    peak = max(clean)
+    settled = clean[-1]
+    natural = max(0.0, float(passive)) if isinstance(passive, (int, float)) and math.isfinite(passive) else 0.0
+    if peak < max(0.006, natural * 1.15):
+        return 0.50
+    retained = max(0.0, min(1.0, (settled - natural * 0.5) / max(0.012, peak)))
+    clean_intervals = [max(0.0, float(value)) for value in interval_deltas
+                       if isinstance(value, (int, float)) and math.isfinite(value)]
+    ongoing = (sorted(clean_intervals)[len(clean_intervals) // 2] if clean_intervals else 0.0)
+    drift = max(0.0, min(1.0, ongoing / max(0.012, peak)))
+    steady = max(0.0, min(1.0, float(stability))) if isinstance(stability, (int, float)) and math.isfinite(stability) else 0.0
+    return max(0.20, min(1.0, 0.25 + 0.35 * retained + 0.27 * steady + 0.13 * (1.0 - drift)))
+
+
+def camera_frame_alignment(before, after):
+    if not isinstance(before, (bytes, bytearray)) or not isinstance(after, (bytes, bytearray)) or len(before) != W * H * 4 or len(after) != len(before):
+        return (0.0, (0, 0), 0.0)
+    coordinates = tuple((x, y) for y in range(20, H - 20, 11) for x in range(20, W - 20, 11))
+    base = tuple((before[(y * W + x) * 4 + 1] * 2 + before[(y * W + x) * 4]
+                  + before[(y * W + x) * 4 + 2]) for x, y in coordinates)
+    candidates = (-12, -8, -4, 0, 4, 8, 12)
+    no_shift = None
+    best = (float('inf'), 0, 0)
+    for dy in candidates:
+        for dx in candidates:
+            total = 0
+            for (x, y), initial in zip(coordinates, base):
+                offset = ((y + dy) * W + x + dx) * 4
+                total += abs(initial - (after[offset + 1] * 2 + after[offset] + after[offset + 2]))
+            mean = total / max(1, len(coordinates) * 1020)
+            if dx == 0 and dy == 0:
+                no_shift = mean
+            if mean < best[0]:
+                best = (mean, dx, dy)
+    original = no_shift if no_shift is not None else best[0]
+    confidence = max(0.0, min(1.0, (original - best[0]) / max(0.02, original)))
+    if best[1:] == (0, 0) or original < 0.035:
+        confidence = 0.0
+    return best[0], (best[1], best[2]), confidence
+
+
+def action_response_evidence(samples, passive, pre_action, drift, stability, sample_times=None):
+    clean = [max(0.0, float(v)) for v in samples if isinstance(v, (float, int)) and math.isfinite(v)]
+    if len(clean) < 2:
+        return 0.0
+    floor = max(0.005, max(0.0, passive) * 1.7, max(0.0, pre_action) * 0.85,
+                min(max(clean), max(0.0, drift)) * 0.55)
+    peak = max(clean)
+    surplus = max(0.0, peak - floor)
+    retention = max(0.0, min(1.0, (clean[-1] - floor * 0.40) / max(0.015, peak)))
+    timing = 1.0
+    if isinstance(sample_times, (tuple, list)) and len(sample_times) == len(clean):
+        if clean.index(peak) == 0 and drift > peak * 0.50:
+            timing *= 0.72
+    return max(0.0, min(1.0, surplus / max(0.015, peak) *
+                         (0.30 + 0.35 * retention + 0.35 * max(0.0, min(1.0, stability))) * timing))
+
 
 WORLD_FEATURE_COUNT = 128
 WORLD_IMPORTANCE = tuple(2.6 if i >= 124 else 2.1 if i >= WORLD_VISUAL_COUNT
@@ -210,9 +273,10 @@ class LocalGlyphTemplates:
                  '装备道具背包使用购买出售获得领取接受拒绝设置选项帮助保存加载'
                  '地图位置角色玩家敌人攻击防御跳跃移动方向左右上下提示注意'
                  '单人多人模式剧情竞技匹配在线离线网络连接商店继续退出'
-                 '任意按键点击触摸选中确定暂停请稍候刷新等待错误')
+                 '任意按键点击触摸选中确定暂停请稍候刷新等待错误'
+                 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+-:?!/.%')
         try:
-            for face in ('Microsoft YaHei UI', 'SimSun', 'Microsoft JhengHei UI'):
+            for face in ('Microsoft YaHei UI', 'SimSun', 'Microsoft JhengHei UI', 'Segoe UI', 'Arial', 'Consolas'):
                 for height in (14, 18, 24, 31):
                     font = gdi.CreateFontW(height, 0, 0, 0, 650 if height % 2 else 450, 0, 0, 0, 1, 0, 0, 5, 0, face)
                     if not font:
@@ -277,6 +341,35 @@ LPARAM = ctypes.c_ssize_t
 WINPROC = getattr(ctypes, 'WINFUNCTYPE', ctypes.CFUNCTYPE)(LRESULT, HWND, ctypes.c_uint, WPARAM, LPARAM)
 HOOKPROC = getattr(ctypes, 'WINFUNCTYPE', ctypes.CFUNCTYPE)(LRESULT, ctypes.c_int, WPARAM, LPARAM)
 WNDENUMPROC = getattr(ctypes, 'WINFUNCTYPE', ctypes.CFUNCTYPE)(ctypes.c_int, HWND, LPARAM)
+
+
+def capture_viewport(rect, width=W, height=H):
+    actual_width, actual_height = max(1, int(rect[2])), max(1, int(rect[3]))
+    scale = min(width / actual_width, height / actual_height)
+    content_width = max(1, min(width, int(round(actual_width * scale))))
+    content_height = max(1, min(height, int(round(actual_height * scale))))
+    return ((width - content_width) // 2, (height - content_height) // 2,
+            content_width, content_height)
+
+
+def image_point_to_rect(u, v, rect, width=W, height=H):
+    ox, oy, content_width, content_height = capture_viewport(rect, width, height)
+    source_x = max(0.0, min(1.0, (float(u) * width - ox) / content_width))
+    source_y = max(0.0, min(1.0, (float(v) * height - oy) / content_height))
+    return source_x, source_y
+
+
+def compose_capture_frame(frame, width, height, offset_x, offset_y, content_width, content_height):
+    if len(frame) != content_width * content_height * 4:
+        raise ValueError('采集画面的字节长度错误')
+    if offset_x == 0 and offset_y == 0 and content_width == width and content_height == height:
+        return frame
+    result = bytearray(width * height * 4)
+    stride = content_width * 4
+    for row in range(content_height):
+        start = (offset_y + row) * width * 4 + offset_x * 4
+        result[start:start + stride] = frame[row * stride:(row + 1) * stride]
+    return bytes(result)
 
 
 def luminance_bgr(blue, green, red):
@@ -499,12 +592,8 @@ def stop_equivalent(a, b):
     if a == b:
         return True
     for generic, left, right in ((16, 160, 161), (17, 162, 163), (18, 164, 165)):
-        if b == generic:
+        if b in (generic, left, right):
             return a in (generic, left, right)
-        if b == left:
-            return a in (generic, left)
-        if b == right:
-            return a == right
     return False
 
 
@@ -525,7 +614,11 @@ class StopKeyGate:
         self.injected_release_grace_until = 0.0
         self.poll_stops = 0
         self.poll_accessible = True
+        self.poll_consecutive_down = 0
+        self.poll_consecutive_up = 0
         self.prefer_physical_events = False
+        self.trusted_source_tick = 0.0
+        self.allow_local_press = True
         self.last_physical_event = 0.0
         self.on_stop = None
         try:
@@ -542,7 +635,7 @@ class StopKeyGate:
             if not pressed:
                 self.armed = True
                 return False
-            if not self.armed or self.stop_event.is_set():
+            if not self.allow_local_press or not self.armed or self.stop_event.is_set():
                 return False
             self.armed = False
             self.stop_event.set()
@@ -567,27 +660,35 @@ class StopKeyGate:
     def prefer_trusted_sources(self, active):
         with self.lock:
             self.prefer_physical_events = bool(active)
+            self.trusted_source_tick = time.monotonic() if active else 0.0
 
     def poll(self, allow_press=True):
-        allow_press = bool(allow_press)
+        allow_press = bool(allow_press and self.allow_local_press)
         try:
-            state = int(self.native.user.GetAsyncKeyState(self.vk)) & 0xFFFF
-            pressed = bool(state & 0x8000)
-            tapped = bool(state & 0x0001)
+            pressed = bool(int(self.native.user.GetAsyncKeyState(self.vk)) & 0x8000)
         except Exception:
             self.poll_accessible = False
             return self.stop_event.is_set()
         self.poll_accessible = True
-        if not pressed:
-            with self.lock:
+        with self.lock:
+            if pressed:
+                self.poll_consecutive_down = min(1000, self.poll_consecutive_down + 1)
+                self.poll_consecutive_up = 0
+            else:
+                self.poll_consecutive_down = 0
+                self.poll_consecutive_up = min(1000, self.poll_consecutive_up + 1)
                 if self.injected_down:
                     self.injected_down = False
                     self.injected_release_grace_until = time.monotonic() + 0.12
-            self.observe(False)
-            if allow_press and tapped and not self.injected_blocked() and self.observe(True):
+            trusted = self.prefer_physical_events and time.monotonic() - self.trusted_source_tick < 0.30
+            down_samples = self.poll_consecutive_down
+            up_samples = self.poll_consecutive_up
+        if not pressed:
+            if up_samples >= 2:
+                self.observe(False)
+        elif allow_press and down_samples >= (5 if trusted else 1) and not self.injected_blocked():
+            if self.observe(True):
                 self.poll_stops += 1
-        elif allow_press and not self.injected_blocked() and self.observe(True):
-            self.poll_stops += 1
         return self.stop_event.is_set()
 
 
@@ -641,31 +742,50 @@ class StopGuardian:
 
 
 def run_stop_watch(vk, parent_pid):
-    user = ctypes.WinDLL('user32', use_last_error=True)
-    user.GetAsyncKeyState.argtypes = [ctypes.c_int]
-    user.GetAsyncKeyState.restype = ctypes.c_short
     kernel = ctypes.WinDLL('kernel32', use_last_error=True)
     kernel.OpenProcess.argtypes = [ctypes.c_uint, ctypes.c_int, ctypes.c_uint]
     kernel.OpenProcess.restype = ctypes.c_void_p
     kernel.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint]
     kernel.WaitForSingleObject.restype = ctypes.c_uint
     kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel.CloseHandle.restype = ctypes.c_int
     parent = kernel.OpenProcess(0x00100000, 0, parent_pid)
     if not parent:
         return
+    native = Native()
+    stopped = threading.Event()
+    gate = StopKeyGate(native, vk, stopped)
+    def report_stop():
+        try:
+            sys.stdout.buffer.write(b'STOP\n')
+            sys.stdout.buffer.flush()
+        except (OSError, ValueError):
+            pass
+    gate.on_stop = report_stop
+    listener = None
+    last_listener_attempt = 0.0
     try:
-        armed = not bool(user.GetAsyncKeyState(vk) & 0x8000)
-        while kernel.WaitForSingleObject(parent, 0) == 0x102:
-            pressed = bool(user.GetAsyncKeyState(vk) & 0x8000)
-            if not pressed:
-                armed = True
-            elif armed:
-                sys.stdout.buffer.write(b'STOP\n')
-                sys.stdout.buffer.flush()
-                return
-            time.sleep(0.008)
+        while kernel.WaitForSingleObject(parent, 0) == 0x102 and not stopped.is_set():
+            if (listener is None or not listener.healthy()) and time.monotonic() - last_listener_attempt >= 0.8:
+                last_listener_attempt = time.monotonic()
+                if listener is not None:
+                    listener.close()
+                listener = None
+                try:
+                    candidate = StopListener(native, vk, stopped, gate)
+                    candidate.start()
+                    listener = candidate
+                except (OSError, RuntimeError):
+                    gate.prefer_trusted_sources(False)
+            if listener is None:
+                gate.poll(allow_press=True)
+            stopped.wait(0.02)
     finally:
+        if listener is not None:
+            listener.close()
         kernel.CloseHandle(parent)
+        if native.com_initialized:
+            native.ole.CoUninitialize()
 
 
 class StopListener:
@@ -807,6 +927,7 @@ class StopListener:
             msg = MSG()
             while not self.ending.is_set() and not self.stop_event.is_set():
                 self.last_tick = time.monotonic()
+                self.gate.prefer_trusted_sources(bool(raw_registered or hook))
                 try:
                     self.gate.poll(allow_press=True)
                     while self.native.user.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1):
@@ -815,7 +936,7 @@ class StopListener:
                             break
                         if msg.message == WM_HOTKEY and msg.wParam == 8915:
                             self.hotkey_events += 1
-                            if not self.gate.injected_blocked():
+                            if not self.gate.injected_blocked() and not (raw_registered or hook):
                                 self.gate.observe(True)
                             continue
                         self.native.user.TranslateMessage(ctypes.byref(msg))
@@ -895,6 +1016,7 @@ class NativeDXGI:
         self.np = np_module
         self.device = HWND()
         self.context = HWND()
+        self.adapter_devices = []
         self.outputs = []
         self.duplication = HWND()
         self.staging = HWND()
@@ -907,42 +1029,61 @@ class NativeDXGI:
         try:
             library = ctypes.WinDLL('d3d11.dll')
             create = library.D3D11CreateDevice
-            create.argtypes = [HWND, ctypes.c_uint, HWND, ctypes.c_uint, HWND, ctypes.c_uint, ctypes.c_uint, ctypes.POINTER(HWND), ctypes.POINTER(ctypes.c_uint), ctypes.POINTER(HWND)]
+            create.argtypes = [HWND, ctypes.c_uint, HWND, ctypes.c_uint, HWND, ctypes.c_uint,
+                               ctypes.c_uint, ctypes.POINTER(HWND), ctypes.POINTER(ctypes.c_uint),
+                               ctypes.POINTER(HWND)]
             create.restype = ctypes.c_long
-            level = ctypes.c_uint()
-            result = create(None, 1, None, 0x20, None, 0, 7, ctypes.byref(self.device), ctypes.byref(level), ctypes.byref(self.context))
-            if result < 0 or not self.device.value or not self.context.value:
-                raise OSError('D3D11 硬件设备初始化失败')
-            dxgi = self.query(self.device, '54ec77fa-1377-44e6-8c32-88fd5f44c84c')
-            adapter = HWND()
+            create_factory = ctypes.WinDLL('dxgi.dll').CreateDXGIFactory1
+            create_factory.argtypes = [ctypes.POINTER(GUID), ctypes.POINTER(HWND)]
+            create_factory.restype = ctypes.c_long
+            iid = GUID.from_buffer_copy(uuid.UUID('770aae78-f26f-4dba-a829-253c83d1b387').bytes_le)
+            factory = HWND()
+            status = create_factory(ctypes.byref(iid), ctypes.byref(factory))
+            if status < 0 or not factory.value:
+                raise OSError('无法枚举 DXGI 显示适配器')
             try:
-                self.invoke(dxgi, 7, ctypes.c_long, ctypes.POINTER(HWND))(dxgi, ctypes.byref(adapter))
-                if not adapter.value:
-                    raise OSError('无法获取 DXGI 显示适配器')
-                index = 0
-                while index < 16:
-                    output = HWND()
-                    status = self.invoke(adapter, 7, ctypes.c_long, ctypes.c_uint, ctypes.POINTER(HWND))(adapter, index, ctypes.byref(output))
-                    if status < 0 or not output.value:
+                for adapter_number in range(32):
+                    adapter = HWND()
+                    status = self.invoke(factory, 12, ctypes.c_long, ctypes.c_uint,
+                                         ctypes.POINTER(HWND))(factory, adapter_number, ctypes.byref(adapter))
+                    if status < 0 or not adapter.value:
                         break
                     try:
-                        desc = DXGIOutputDescription()
-                        status = self.invoke(output, 7, ctypes.c_long, ctypes.POINTER(DXGIOutputDescription))(output, ctypes.byref(desc))
-                        if status < 0 or not desc.AttachedToDesktop or desc.Rotation != 1:
+                        device, context, level = HWND(), HWND(), ctypes.c_uint()
+                        result = create(adapter, 0, None, 0x20, None, 0, 7,
+                                        ctypes.byref(device), ctypes.byref(level), ctypes.byref(context))
+                        if result < 0 or not device.value or not context.value:
+                            self.release(device)
+                            self.release(context)
                             continue
-                        rect = desc.DesktopCoordinates
-                        if rect.right <= rect.left or rect.bottom <= rect.top:
-                            continue
-                        output1 = self.query(output, '00cddea8-939b-4b83-a340-a685226666cc')
-                        self.outputs.append(((rect.left, rect.top, rect.right, rect.bottom), output1))
-                    except OSError:
-                        pass
+                        owner = len(self.adapter_devices)
+                        self.adapter_devices.append((device, context))
+                        for output_number in range(32):
+                            output = HWND()
+                            result = self.invoke(adapter, 7, ctypes.c_long, ctypes.c_uint,
+                                                 ctypes.POINTER(HWND))(adapter, output_number, ctypes.byref(output))
+                            if result < 0 or not output.value:
+                                break
+                            try:
+                                desc = DXGIOutputDescription()
+                                result = self.invoke(output, 7, ctypes.c_long,
+                                                     ctypes.POINTER(DXGIOutputDescription))(output, ctypes.byref(desc))
+                                if result < 0 or not desc.AttachedToDesktop or desc.Rotation not in (1, 2, 3, 4):
+                                    continue
+                                rect = desc.DesktopCoordinates
+                                if rect.right <= rect.left or rect.bottom <= rect.top:
+                                    continue
+                                output1 = self.query(output, '00cddea8-939b-4b83-a340-a685226666cc')
+                                self.outputs.append(((rect.left, rect.top, rect.right, rect.bottom),
+                                                     output1, owner, int(desc.Rotation)))
+                            except OSError:
+                                pass
+                            finally:
+                                self.release(output)
                     finally:
-                        self.release(output)
-                        index += 1
+                        self.release(adapter)
             finally:
-                self.release(adapter)
-                self.release(dxgi)
+                self.release(factory)
             if not self.outputs:
                 raise OSError('没有可用的 DXGI 桌面输出')
         except Exception:
@@ -978,11 +1119,13 @@ class NativeDXGI:
         self.active = None
         self.buffer = None
         self.pitch = 0
+        self.buffer_width = 0
+        self.buffer_height = 0
         self.frame_protected = False
 
     def _select(self, rect):
         x, y, width, height = rect
-        for index, (bounds, _) in enumerate(self.outputs):
+        for index, (bounds, _, _, _) in enumerate(self.outputs):
             left, top, right, bottom = bounds
             if x >= left and y >= top and x + width <= right and y + height <= bottom:
                 return index
@@ -993,6 +1136,7 @@ class NativeDXGI:
             return
         self._reset()
         output = self.outputs[index][1]
+        self.device, self.context = self.adapter_devices[self.outputs[index][2]]
         result = self.invoke(output, 22, ctypes.c_long, HWND, ctypes.POINTER(HWND))(output, self.device, ctypes.byref(self.duplication))
         if result < 0 or not self.duplication.value:
             raise OSError(f'桌面复制接口不可用：0x{result & 0xffffffff:08x}')
@@ -1011,6 +1155,8 @@ class NativeDXGI:
     def _capture(self, index):
         bounds = self.outputs[index][0]
         width, height = bounds[2] - bounds[0], bounds[3] - bounds[1]
+        if self.outputs[index][3] in (2, 4):
+            width, height = height, width
         info = DXGIFrameInfo()
         resource = HWND()
         status = self.invoke(self.duplication, 8, ctypes.c_long, ctypes.c_uint, ctypes.POINTER(DXGIFrameInfo), ctypes.POINTER(HWND))(self.duplication, 24, ctypes.byref(info), ctypes.byref(resource))
@@ -1046,6 +1192,16 @@ class NativeDXGI:
             if self.duplication.value:
                 self.invoke(self.duplication, 14, ctypes.c_long)(self.duplication)
 
+    def _source_xy(self, index, x, y):
+        rotation = self.outputs[index][3]
+        if rotation == 2:
+            return y, self.buffer_height - 1 - x
+        if rotation == 3:
+            return self.buffer_width - 1 - x, self.buffer_height - 1 - y
+        if rotation == 4:
+            return self.buffer_width - 1 - y, x
+        return x, y
+
     def _grab_spanned(self, rect, width, height):
         if len(self.outputs) < 2:
             return None
@@ -1056,7 +1212,7 @@ class NativeDXGI:
         ys = [y0 + min(rh - 1, y * rh // height) for y in range(height)]
         result = bytearray(width * height * 4)
         occupied = bytearray(width * height)
-        for index, (bounds, _) in enumerate(self.outputs):
+        for index, (bounds, _, _, _) in enumerate(self.outputs):
             left, top, right, bottom = bounds
             columns = [(col, x - left) for col, x in enumerate(xs) if left <= x < right]
             rows = [(row, y - top) for row, y in enumerate(ys) if top <= y < bottom]
@@ -1066,12 +1222,12 @@ class NativeDXGI:
             if not self._capture(index) or self.frame_protected:
                 return None
             raw = self.buffer
-            for row, offset_y in rows:
-                source = offset_y * self.pitch
+            for row, relative_y in rows:
                 destination = row * width * 4
                 mask_start = row * width
-                for column, offset_x in columns:
-                    src = source + offset_x * 4
+                for column, relative_x in columns:
+                    source_x, source_y = self._source_xy(index, relative_x, relative_y)
+                    src = source_y * self.pitch + source_x * 4
                     dst = destination + column * 4
                     result[dst:dst + 4] = raw[src:src + 4]
                     occupied[mask_start + column] = 1
@@ -1084,7 +1240,7 @@ class NativeDXGI:
         self._connect(index)
         if not self._capture(index) or self.frame_protected:
             return None
-        left, top, right, bottom = self.outputs[index][0]
+        left, top, _, _ = self.outputs[index][0]
         sx, sy = rect[0] - left, rect[1] - top
         rw, rh = rect[2], rect[3]
         if self.np is not None:
@@ -1093,25 +1249,31 @@ class NativeDXGI:
             xs = sx + np.minimum(rw - 1, np.arange(width, dtype=np.int32) * rw // width)
             ys = sy + np.minimum(rh - 1, np.arange(height, dtype=np.int32) * rh // height)
             image = image[:, :self.buffer_width * 4].reshape(self.buffer_height, self.buffer_width, 4)
-            return np.ascontiguousarray(image[ys[:, None], xs[None, :]]).tobytes()
+            relative_x, relative_y = self._source_xy(index, xs[None, :], ys[:, None])
+            return np.ascontiguousarray(image[relative_y, relative_x]).tobytes()
         raw = self.buffer
         result = bytearray(width * height * 4)
         xs = [sx + min(rw - 1, c * rw // width) for c in range(width)]
-        for row in range(height):
-            source = (sy + min(rh - 1, row * rh // height)) * self.pitch
+        ys = [sy + min(rh - 1, row * rh // height) for row in range(height)]
+        for row, relative_y in enumerate(ys):
             destination = row * width * 4
-            for col, x in enumerate(xs):
-                pos = source + x * 4
+            for col, relative_x in enumerate(xs):
+                source_x, source_y = self._source_xy(index, relative_x, relative_y)
+                pos = source_y * self.pitch + source_x * 4
                 result[destination + col * 4:destination + col * 4 + 4] = raw[pos:pos + 4]
         return bytes(result)
 
     def close(self):
         self._reset()
-        for _, output in self.outputs:
+        for _, output, _, _ in self.outputs:
             self.release(output)
         self.outputs.clear()
-        self.release(self.context)
-        self.release(self.device)
+        for device, context in self.adapter_devices:
+            self.release(context)
+            self.release(device)
+        self.adapter_devices.clear()
+        self.device = HWND()
+        self.context = HWND()
 
 
 class WorkspaceLease:
@@ -1174,6 +1336,9 @@ class Capture:
         self.identity_count = 0
         self.low_information_frames = 0
         self.last_backend_probe = 0.0
+        self.last_fast_backend_retry = 0.0
+        self.fast_backend_failures = 0
+        self.backend_switches = 0
         self.base = None
         self.detail = None
         self.dx = None
@@ -1330,37 +1495,30 @@ class Capture:
             return False
         if self.n.user.GetForegroundWindow() != hwnd:
             return False
-        old_process = self.n.kernel.OpenProcess(0x1000, 0, self.target_pid or 0)
-        if old_process:
-            try:
-                return False
-            finally:
-                self.n.kernel.CloseHandle(old_process)
-        return getattr(ctypes, 'get_last_error', lambda: 0)() == 87
+        return not (self.target and self.target != hwnd and self.n.user.IsWindow(self.target))
 
     def _window_rank(self, hwnd, identity, width, height, foreground):
         if identity is None or width < 80 or height < 80:
             return None
-        executable = pathlib.PureWindowsPath(identity[2]).name.casefold()
         window_class = identity[1].casefold()
-        if executable in ('explorer.exe', 'taskmgr.exe', 'searchhost.exe', 'startmenuexperiencehost.exe', 'shellexperiencehost.exe', 'systemsettings.exe', 'control.exe', 'gamebar.exe', 'steam.exe'):
+        if window_class in ('progman', 'workerw', 'shell_traywnd'):
             return None
-        if window_class in ('cabinetwclass', 'explorewclass', 'progman', 'workerw', 'shell_traywnd', 'windows.ui.core.corewindow'):
-            return None
-        if self.n.user.GetWindow(hwnd, 4):
-            return None
+        executable = pathlib.PureWindowsPath(identity[2]).name.casefold()
         area = width * height
         screen_area = max(1, self.n.user.GetSystemMetrics(0) * self.n.user.GetSystemMetrics(1))
-        recognized = any(token in window_class or token in executable for token in ('unitywndclass', 'unrealwindow', 'sdl_app', 'glfw', 'godot', 'game', 'pygame', 'roblox', 'steam', 'rpg', 'emulator', 'retroarch'))
-        return (min(15000000, area) + (45000000 if hwnd == foreground else 0)
+        recognized = any(token in window_class or token in executable for token in
+                         ('unitywndclass', 'unrealwindow', 'sdl_app', 'glfw', 'godot', 'game', 'pygame', 'roblox', 'steam', 'rpg', 'emulator', 'retroarch'))
+        foreground_bonus = 45000000 if hwnd == foreground else 0
+        owned_penalty = 6000000 if self.n.user.GetWindow(hwnd, 4) else 0
+        return (min(15000000, area) + foreground_bonus
                 + (2500000 if area >= screen_area * 0.70 else 0)
-                + (8000000 if recognized else 0))
+                + (8000000 if recognized else 0) - owned_penalty)
 
     def _candidate_is_game_like(self, selected):
         if selected is None:
             return False
         identity = selected[2]
-        name = (identity[1] + ' ' + pathlib.PureWindowsPath(identity[2]).name).casefold()
+        name = (identity[1] + ' ' + pathlib.PureWindowsPath(identity[2]).name + ' ' + identity[3]).casefold()
         return any(token in name for token in ('unitywndclass', 'unrealwindow', 'sdl_app', 'glfw', 'godot', 'game', 'pygame', 'roblox', 'steam', 'rpg', 'emulator', 'retroarch'))
 
     def _candidate_visual_evidence(self, hwnd):
@@ -1373,7 +1531,7 @@ class Capture:
             return False
         now = time.monotonic()
         if now - self.target_candidate_last_probe < 0.18:
-            return self.target_candidate_motion >= 0.012 or self.target_candidate_texture >= 0.23
+            return self.target_candidate_motion >= 0.012 or self.target_candidate_texture >= 0.035
         self.target_candidate_last_probe = now
         frame = self._grab(self.base, (origin.x, origin.y, width, height))
         old = self.target_candidate_frame
@@ -1390,7 +1548,7 @@ class Capture:
             indices = range(0, len(frame), step)
             changed = sum(abs(old[i] - frame[i]) for i in indices) / max(1, len(indices) * 255)
             self.target_candidate_motion = max(changed, self.target_candidate_motion * 0.92)
-        return self.target_candidate_motion >= 0.012 or self.target_candidate_texture >= 0.23
+        return self.target_candidate_motion >= 0.012 or self.target_candidate_texture >= 0.035
 
     def _candidates(self, previously_bound=False):
         visible = []
@@ -1445,14 +1603,19 @@ class Capture:
         stable_for = time.monotonic() - self.target_candidate_since
         if self.target_candidate_count < 4 or stable_for < seconds:
             return False
-        if self._candidate_is_game_like(selected):
-            return True
         if selected[1] != self.n.user.GetForegroundWindow():
             return False
-        if not self._candidate_visual_evidence(selected[1]):
+        if self._candidate_is_game_like(selected):
+            return True
+        try:
+            visual_evidence = self._candidate_visual_evidence(selected[1])
+        except OSError:
+            visual_evidence = False
+        if not visual_evidence:
             return False
-        return self.target_candidate_motion >= 0.012 and stable_for >= 0.8 or (
-            stable_for >= 3.0 and self.target_candidate_texture >= 0.23 and self.target_candidate_motion >= 0.003)
+        return bool((self.target_candidate_motion >= 0.012 and stable_for >= 0.8)
+                    or (stable_for >= 1.8 and self.target_candidate_texture >= 0.085)
+                    or (stable_for >= 3.0 and self.target_candidate_texture >= 0.035))
 
     def _bind_window(self, selected):
         self.target = selected[1]
@@ -1520,9 +1683,17 @@ class Capture:
             self.low_information_frames += 1
         else:
             self.low_information_frames = 0
+        now = time.monotonic()
+        if self.native_dx is None and self.dx is None and now - self.last_fast_backend_retry >= min(120.0, 25.0 + 15.0 * self.fast_backend_failures):
+            self.last_fast_backend_retry = now
+            self._initialize_fast_capture()
+            if self.native_dx is None and self.dx is None:
+                self.fast_backend_failures = min(6, self.fast_backend_failures + 1)
+            else:
+                self.fast_backend_failures = 0
+                self.backend_switches += 1
         if self.low_information_frames < 12:
             return
-        now = time.monotonic()
         if now - self.last_backend_probe < 25.0:
             return
         self.last_backend_probe = now
@@ -1539,30 +1710,40 @@ class Capture:
                 pass
         else:
             self._initialize_fast_capture()
+        self.backend_switches += 1
         self.low_information_frames = 0
 
     def _grab(self, surface, rect):
         dc, _, _, bits, width, height = surface
+        ox, oy, cw, ch = capture_viewport(rect, width, height)
         if self.native_dx is not None:
             try:
-                frame = self.native_dx.grab(rect, width, height)
-                if frame is not None and len(frame) == width * height * 4:
-                    return frame
+                frame = self.native_dx.grab(rect, cw, ch)
+                if frame is not None and len(frame) == cw * ch * 4:
+                    return compose_capture_frame(frame, width, height, ox, oy, cw, ch)
             except Exception as exc:
                 self.backend_error = f'DXGI 采集失败：{type(exc).__name__}: {exc}'
                 self.native_dx.close()
                 self.native_dx = None
+                self.last_fast_backend_retry = time.monotonic()
+                self.fast_backend_failures = min(6, self.fast_backend_failures + 1)
+                self.backend_switches += 1
         if self.dx is not None and self.cv_np is not None:
             try:
                 x, y, rw, rh = rect
                 frame = self.dx.grab(region=(x, y, x + rw, y + rh), new_frame_only=False)
                 if frame is not None and len(frame.shape) == 3 and frame.shape[2] == 4:
-                    sy = self.cv_np.minimum(rh - 1, (self.cv_np.arange(height) * rh // height))
-                    sx = self.cv_np.minimum(rw - 1, (self.cv_np.arange(width) * rw // width))
-                    return self.cv_np.ascontiguousarray(frame[sy[:, None], sx[None, :]]).tobytes()
+                    actual_height, actual_width = frame.shape[:2]
+                    sy = self.cv_np.minimum(actual_height - 1, self.cv_np.arange(ch) * actual_height // ch)
+                    sx = self.cv_np.minimum(actual_width - 1, self.cv_np.arange(cw) * actual_width // cw)
+                    data = self.cv_np.ascontiguousarray(frame[sy[:, None], sx[None, :]]).tobytes()
+                    return compose_capture_frame(data, width, height, ox, oy, cw, ch)
             except Exception:
                 camera = self.dx
                 self.dx = None
+                self.last_fast_backend_retry = time.monotonic()
+                self.fast_backend_failures = min(6, self.fast_backend_failures + 1)
+                self.backend_switches += 1
                 if camera is not None:
                     try:
                         camera.stop()
@@ -1576,7 +1757,8 @@ class Capture:
         if not desktop:
             raise OSError('屏幕采集源不可用')
         try:
-            ok = self.n.gdi.StretchBlt(dc, 0, 0, width, height, desktop, rect[0], rect[1], rect[2], rect[3], SRCCOPY | CAPTUREBLT)
+            ctypes.memset(bits, 0, width * height * 4)
+            ok = self.n.gdi.StretchBlt(dc, ox, oy, cw, ch, desktop, rect[0], rect[1], rect[2], rect[3], SRCCOPY | CAPTUREBLT)
             if not ok:
                 raise OSError('屏幕采集失败')
             return ctypes.string_at(bits, width * height * 4)
@@ -1589,6 +1771,7 @@ class Capture:
             return self._grab(self.base, rect), rect
 
     def grab_detail(self, rect, u, v):
+        u, v = image_point_to_rect(u, v, rect)
         rw = min(rect[2], max(96, int(rect[2] * 0.38)))
         rh = min(rect[3], max(96, int(rect[3] * 0.38)))
         ox = rect[0] + max(0, min(rect[2] - rw, int(u * rect[2] - rw * 0.5)))
@@ -1636,7 +1819,12 @@ class Controller:
         self.down = set()
         self.mouse_down = set()
         self.successful_inputs = 0
+        self.attempted_inputs = 0
+        self.failed_inputs = 0
+        self.attempted_action_inputs = 0
+        self.successful_action_inputs = 0
         self.last_successful_input = None
+        self.last_action_input_at = None
         self.action_input_tracking = False
         self.action_first_input_at = None
         self.last_action_detail = None
@@ -1649,6 +1837,8 @@ class Controller:
         self.monitor_interval = 0.045
         self.touch_points = []
         self.ledger_path = None
+        self.ledger_last_state = None
+        self.ledger_last_path = None
         self.touch_available = False
         try:
             self.n.user.InitializeTouchInjection.argtypes = [ctypes.c_uint, ctypes.c_ulong]
@@ -1674,8 +1864,9 @@ class Controller:
         infos = (POINTERTOUCHINFO * len(locations))()
         flags = {'down': 0x10006, 'update': 0x20006, 'up': 0x40000}[phase]
         for i, (u, v) in enumerate(locations):
-            x = rect[0] + round(min(1.0, max(0.0, u)) * max(0, rect[2] - 1))
-            y = rect[1] + round(min(1.0, max(0.0, v)) * max(0, rect[3] - 1))
+            source_u, source_v = image_point_to_rect(u, v, rect)
+            x = rect[0] + round(source_u * max(0, rect[2] - 1))
+            y = rect[1] + round(source_v * max(0, rect[3] - 1))
             infos[i].pointerInfo.pointerType = 2
             infos[i].pointerInfo.pointerId = i
             infos[i].pointerInfo.pointerFlags = flags
@@ -1703,6 +1894,10 @@ class Controller:
         self.journal_inputs()
         self.successful_inputs += 1
         self.last_successful_input = time.monotonic()
+        if phase != 'up' and not self.releasing:
+            self.attempted_action_inputs += 1
+            self.successful_action_inputs += 1
+            self.last_action_input_at = self.last_successful_input
         if self.action_input_tracking and phase != 'up' and self.action_first_input_at is None:
             self.action_first_input_at = self.last_successful_input
         return True
@@ -1712,15 +1907,26 @@ class Controller:
             return
         state = {'build': SOURCE_BUILD, 'pid': os.getpid(), 'stop_vk': self.stop_vk,
                  'keys': sorted(int(vk) for vk in self.down if not stop_equivalent(vk, self.stop_vk)),
-                 'mouse': [list(value) if isinstance(value, tuple) else int(value) for value in self.mouse_down],
-                 'touch': [{'locations': locations, 'rect': list(rect)} for locations, rect in self.touch_points],
-                 'updated': time.time()}
-        temporary = pathlib.Path(str(self.ledger_path) + '.tmp')
-        with temporary.open('w', encoding='utf-8') as stream:
-            json.dump(state, stream, ensure_ascii=False, separators=(',', ':'))
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, self.ledger_path)
+                 'mouse': sorted((list(value) if isinstance(value, tuple) else int(value)
+                                  for value in self.mouse_down), key=str),
+                 'touch': [{'locations': locations, 'rect': list(rect)} for locations, rect in self.touch_points]}
+        serialized = json.dumps(state, ensure_ascii=False, separators=(',', ':'))
+        destination = pathlib.Path(self.ledger_path)
+        if (serialized == self.ledger_last_state and destination == self.ledger_last_path
+                and destination.is_file()):
+            return
+        state['updated'] = time.time()
+        temporary = pathlib.Path(str(destination) + '.tmp')
+        try:
+            with temporary.open('w', encoding='utf-8') as stream:
+                json.dump(state, stream, ensure_ascii=False, separators=(',', ':'))
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, destination)
+        finally:
+            temporary.unlink(missing_ok=True)
+        self.ledger_last_state = serialized
+        self.ledger_last_path = destination
 
     def send(self, inp):
         release_input = (inp.type == 1 and bool(inp.value.ki.dwFlags & KEYEVENTF_KEYUP)) or (inp.type == 0 and bool(inp.value.mi.dwFlags & (MOUSEEVENTF_LEFTUP | MOUSEEVENTF_RIGHTUP | MOUSEEVENTF_MIDDLEUP | MOUSEEVENTF_XUP)))
@@ -1741,12 +1947,20 @@ class Controller:
                 raise OSError('当前输入焦点不属于已绑定的游戏窗口')
             if self.stopped.is_set():
                 return False
+        self.attempted_inputs += 1
+        action_input = not release_input and not self.releasing
+        if action_input:
+            self.attempted_action_inputs += 1
         sent = self.n.user.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
         if sent != 1:
+            self.failed_inputs += 1
             code = getattr(ctypes, 'get_last_error', lambda: 0)()
             raise OSError(code, f'SendInput 失败：{sent}/1，可能受到进程权限或输入保护的阻止')
         self.successful_inputs += 1
         self.last_successful_input = time.monotonic()
+        if action_input:
+            self.successful_action_inputs += 1
+            self.last_action_input_at = self.last_successful_input
         if self.action_input_tracking and not release_input and self.action_first_input_at is None:
             self.action_first_input_at = self.last_successful_input
         return True
@@ -1754,6 +1968,8 @@ class Controller:
     def key(self, vk, pressed):
         if stop_equivalent(vk, self.stop_vk):
             return False
+        if pressed and vk in self.down:
+            return True
         scan = self.n.user.MapVirtualKeyW(vk, 0)
         extended = vk in (33, 34, 35, 36, 37, 38, 39, 40, 45, 46, 91, 92, 93, 111, 163, 165)
         flags = (KEYEVENTF_SCANCODE if scan else 0) | (KEYEVENTF_EXTENDEDKEY if extended else 0) | (0 if pressed else KEYEVENTF_KEYUP)
@@ -1780,6 +1996,13 @@ class Controller:
         return True
 
     def mouse(self, flags, wheel=0, x=0, y=0):
+        held = {MOUSEEVENTF_LEFTDOWN: MOUSEEVENTF_LEFTDOWN,
+                MOUSEEVENTF_RIGHTDOWN: MOUSEEVENTF_RIGHTDOWN,
+                MOUSEEVENTF_MIDDLEDOWN: MOUSEEVENTF_MIDDLEDOWN}
+        if flags in held and held[flags] in self.mouse_down:
+            return True
+        if flags == MOUSEEVENTF_XDOWN and ('x', int(wheel)) in self.mouse_down:
+            return True
         data = INPUT()
         data.type = 0
         data.value.mi = MOUSEINPUT(x, y, wheel & 0xFFFFFFFF, flags, 0, 0)
@@ -1810,15 +2033,17 @@ class Controller:
                 self.mouse_down.discard(down)
         if changes or flags & (MOUSEEVENTF_LEFTUP | MOUSEEVENTF_RIGHTUP | MOUSEEVENTF_MIDDLEUP | MOUSEEVENTF_XUP):
             self.journal_inputs()
+        return True
 
     def move(self, u, v, rect):
-        x = rect[0] + round(min(1.0, max(0.0, u)) * max(0, rect[2] - 1))
-        y = rect[1] + round(min(1.0, max(0.0, v)) * max(0, rect[3] - 1))
+        source_u, source_v = image_point_to_rect(u, v, rect)
+        x = rect[0] + round(source_u * max(0, rect[2] - 1))
+        y = rect[1] + round(source_v * max(0, rect[3] - 1))
         sx, sy = self.n.user.GetSystemMetrics(76), self.n.user.GetSystemMetrics(77)
         sw, sh = max(1, self.n.user.GetSystemMetrics(78) - 1), max(1, self.n.user.GetSystemMetrics(79) - 1)
         px = max(0, min(65535, round((x - sx) * 65535 / sw)))
         py = max(0, min(65535, round((y - sy) * 65535 / sh)))
-        self.mouse(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK, x=px, y=py)
+        return self.mouse(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK, x=px, y=py)
 
     def delay(self, seconds):
         deadline = time.monotonic() + max(0.0, seconds)
@@ -1906,14 +2131,20 @@ class Controller:
             return False
         kind, a, b, x, y = action.kind, action.a, action.b, action.x, action.y
         composed_mouse = False
+        composed_third = 0
         if kind == 'compose':
             if parameters is not None and len(parameters) >= 9:
                 a, b = int(parameters[6]), int(parameters[7])
                 composed_mouse = bool(parameters[8])
+                if len(parameters) >= 10:
+                    composed_third = int(parameters[9])
             if not (8 <= a <= 254 and not stop_equivalent(a, self.stop_vk)):
                 return False
             if not (8 <= b <= 254 and b != a and not stop_equivalent(b, self.stop_vk)):
                 b = 0
+            if not (8 <= composed_third <= 254 and composed_third not in (a, b)
+                    and not stop_equivalent(composed_third, self.stop_vk)):
+                composed_third = 0
             if parameters is not None and len(parameters) >= 2:
                 x, y = max(0.0, min(1.0, float(parameters[0]))), max(0.0, min(1.0, float(parameters[1])))
         requested_duration = parameters[2] if parameters is not None else action.duration
@@ -1943,7 +2174,14 @@ class Controller:
         actual_wait = 0.0
         finished = False
         primary_input_sent = False
-        down_was_held = kind == 'hold' and a in self.down
+        persistent_keys = (() if kind not in ('hold', 'pair_hold', 'move_fire', 'combat', 'aim', 'chord', 'compose') else
+                           tuple(code for code in (a, b, composed_third) if code)
+                           if kind == 'compose' else
+                           (a, b) if kind in ('pair_hold', 'chord') and b else
+                           (a,) if a else ())
+        persistent_mouse = ((MOUSEEVENTF_LEFTDOWN,) if kind in ('move_fire', 'combat', 'aim')
+                            or kind == 'compose' and composed_mouse else ())
+        down_was_held = bool(set(persistent_keys) & self.down or set(persistent_mouse) & self.mouse_down)
         def pause(seconds):
             nonlocal planned_wait, actual_wait
             seconds = max(0.0, float(seconds))
@@ -1965,7 +2203,7 @@ class Controller:
                     return False
             return True
         try:
-            self.release(preserve_keys=(a,) if kind == 'hold' else ())
+            self.release(preserve_keys=persistent_keys, preserve_mouse=persistent_mouse)
             emitted_before = self.successful_inputs
             self.action_input_tracking = True
             if down_was_held:
@@ -1988,11 +2226,10 @@ class Controller:
                     self.move(x, y, rect)
                 if self.key(a, True):
                     primary_input_sent = True
-                    if b:
-                        self.key(b, True)
-                    if composed_mouse:
-                        self.mouse(MOUSEEVENTF_LEFTDOWN)
-                    finished = pause(duration)
+                    if (not b or self.key(b, True)) and (not composed_third or self.key(composed_third, True)):
+                        if composed_mouse:
+                            self.mouse(MOUSEEVENTF_LEFTDOWN)
+                        finished = pause(duration)
             elif kind == 'move_fire':
                 if self.key(a, True):
                     self.mouse(MOUSEEVENTF_LEFTDOWN)
@@ -2138,15 +2375,16 @@ class Controller:
             self.action_input_tracking = False
             first_input_at = self.action_first_input_at
             self.monitor = None
-            if kind == 'hold' and finished and not self.stopped.is_set() and not self.feedback_break:
-                self.release(preserve_keys=(a,))
+            if finished and not self.stopped.is_set() and not self.feedback_break:
+                self.release(preserve_keys=persistent_keys, preserve_mouse=persistent_mouse)
             else:
                 self.release()
             emitted = emitted_during_action + int(down_was_held)
             interrupted = bool(self.stopped.is_set() or self.feedback_break or not finished)
             if emitted > 0 and primary_input_sent:
                 self.last_action_detail = {
-                    'kind': kind, 'a': int(a), 'b': int(b), 'composed_mouse': bool(composed_mouse), 'x': float(x), 'y': float(y),
+                    'kind': kind, 'a': int(a), 'b': int(b), 'c': int(composed_third),
+                    'composed_mouse': bool(composed_mouse), 'x': float(x), 'y': float(y),
                     'start_x': float(initial_x), 'start_y': float(initial_y),
                     'duration': float(actual_wait), 'requested_duration': float(requested_duration), 'extent': float(extent),
                     'scheduled_duration': float(duration),
@@ -2154,6 +2392,8 @@ class Controller:
                     'interrupted': interrupted, 'finished': bool(finished and not interrupted),
                     'interruption_reason': 'stop_key' if self.stopped.is_set() else self.interruption_reason if self.feedback_break else 'incomplete_action' if not finished else None,
                     'input_sent': True, 'sent_events': int(emitted),
+                    'windows_input_dispatch_confirmed': bool(primary_input_sent and emitted > 0),
+                    'game_input_received_verified': None,
                     'command_start_monotonic': command_start_monotonic,
                     'input_first_monotonic': first_input_at,
                     'input_dispatch_delay_seconds': (max(0.0, first_input_at - command_start_monotonic)
@@ -2226,47 +2466,151 @@ def actions_for(stop_vk):
 
 
 class VisualRepresentation:
-    def __init__(self):
+    def __init__(self, np_module=None):
         generator = random.Random(230941)
-        self.encoder = [[generator.uniform(-0.15, 0.15) for _ in range(64)] for _ in range(VISUAL_LATENT_COUNT)]
-        self.decoder = [[generator.uniform(-0.11, 0.11) for _ in range(VISUAL_LATENT_COUNT)] for _ in range(64)]
+        self.np = np_module if getattr(np_module, '__name__', None) == 'numpy' else None
+        self.encoder = [[generator.uniform(-0.105, 0.105) for _ in range(VISUAL_SOURCE_COUNT)]
+                        for _ in range(VISUAL_LATENT_COUNT)]
+        self.decoder = [[generator.uniform(-0.075, 0.075) for _ in range(VISUAL_LATENT_COUNT)]
+                        for _ in range(VISUAL_SOURCE_COUNT)]
+        self.transition_weights = [[0.0] * VISUAL_LATENT_COUNT for _ in range(VISUAL_LATENT_COUNT)]
         self.bias = [0.0] * VISUAL_LATENT_COUNT
-        self.decoder_bias = [0.0] * 64
+        self.decoder_bias = [0.0] * VISUAL_SOURCE_COUNT
+        self.previous_source = None
         self.action_deltas = OrderedDict()
         self.steps = 0
         self.reconstruction_error = 0.0
         self.transition_error = 0.0
+        self.temporal_motion = None
 
-    def observe(self, rgb, motion, edges):
+    def accelerated_step(self, source, rate):
+        np = self.np
+        if not hasattr(self.encoder, 'shape'):
+            self.encoder = np.asarray(self.encoder, dtype=np.float32)
+            self.decoder = np.asarray(self.decoder, dtype=np.float32)
+            self.bias = np.asarray(self.bias, dtype=np.float32)
+            self.decoder_bias = np.asarray(self.decoder_bias, dtype=np.float32)
+        values = np.asarray(source, dtype=np.float32)
+        latent = np.tanh(self.encoder @ values + self.bias)
+        reconstruction = self.decoder @ latent + self.decoder_bias
+        errors = np.clip(values - reconstruction, -1.0, 1.0)
+        loss = float(np.mean(errors * errors))
+        derivatives = (self.decoder.T @ errors) * (1.0 - latent * latent)
+        self.decoder = np.clip(self.decoder + rate * errors[:, None] * latent[None, :], -1.5, 1.5)
+        self.decoder_bias = np.clip(self.decoder_bias + rate * errors, -1.0, 1.0)
+        self.encoder = np.clip(self.encoder + rate * 0.18 * derivatives[:, None] * values[None, :], -1.5, 1.5)
+        self.bias = np.clip(self.bias + rate * 0.18 * derivatives, -1.0, 1.0)
+        return latent.tolist(), loss
+
+    def observe(self, rgb, motion, edges, objects=None, relations=None, fine_detail=None, camera_motion=None):
+        if len(rgb) != GW * GH or len(motion) != GW * GH or len(edges) != GW * GH:
+            raise ValueError('自监督视觉输入的分辨率不匹配')
+        camera_consensus = (max(0.0, min(1.0, float(camera_motion[2])))
+                            if isinstance(camera_motion, (list, tuple)) and len(camera_motion) >= 3
+                            and isinstance(camera_motion[2], (int, float)) and math.isfinite(camera_motion[2]) else 0.0)
+        stabilized_motion = [value * (1.0 - 0.68 * camera_consensus) for value in motion]
+        if self.temporal_motion is not None and self.previous_source is not None:
+            stabilized_motion = [max(0.0, min(1.0, 0.78 * value + 0.22 * previous))
+                                 for value, previous in zip(stabilized_motion, self.temporal_motion)]
+        self.temporal_motion = stabilized_motion[:]
+        occupied = [0.0] * 16
+        related = [0.0] * 16
+        tracked = {}
+        for item in (objects or ())[:64]:
+            try:
+                x, y = float(item['x']), float(item['y'])
+                strength = max(0.0, min(1.0, float(item.get('confidence', 0.0))))
+                strength *= min(1.0, max(0.0, float(item.get('age', 0.0))) / 4.0)
+                strength *= 0.65 + 0.35 * max(0.0, min(1.0, float(item.get('control_probability', 0.0))))
+                if math.isfinite(x) and math.isfinite(y) and math.isfinite(strength):
+                    cell = max(0, min(3, int(y * 4))) * 4 + max(0, min(3, int(x * 4)))
+                    occupied[cell] = min(1.0, occupied[cell] + strength)
+                    tracked[item.get('track_id')] = cell
+            except (TypeError, ValueError, OverflowError, KeyError):
+                continue
+        for item in (relations or ())[:32]:
+            try:
+                score = max(0.0, min(1.0, float(item.get('confidence', 0.0))))
+                score *= 0.4 + 0.6 * max(0.0, min(1.0, float(item.get('contact_likelihood', 0.0))))
+                for key in ('source', 'target'):
+                    if item.get(key) in tracked:
+                        cell = tracked[item[key]]
+                        related[cell] = min(1.0, related[cell] + score * 0.5)
+            except (TypeError, ValueError, OverflowError):
+                continue
         source = []
+        previous = self.previous_source
+        global_luminance = sum(luminance_bgr(*pixel) for pixel in rgb) / len(rgb)
         for row in range(4):
             for col in range(4):
                 indices = [y * GW + x for y in range(row * GH // 4, (row + 1) * GH // 4)
                            for x in range(col * GW // 4, (col + 1) * GW // 4)]
                 scale = 1.0 / len(indices)
-                source.extend((sum(luminance_bgr(*rgb[index]) for index in indices) * scale,
-                               sum((rgb[index][2] - rgb[index][0]) / 255.0 for index in indices) * scale,
-                               sum(motion[index] for index in indices) * scale,
+                light = sum(luminance_bgr(*rgb[index]) for index in indices) * scale
+                red_blue = sum((rgb[index][2] - rgb[index][0]) / 255.0 for index in indices) * scale
+                green_blue = sum((rgb[index][1] - rgb[index][0]) / 255.0 for index in indices) * scale
+                movement = sum(stabilized_motion[index] for index in indices) * scale
+                contour = sum(edges[index] for index in indices) * scale
+                saturation = sum((max(rgb[index]) - min(rgb[index])) / 255.0 for index in indices) * scale
+                cell = row * 4 + col
+                shift = light - previous[cell * 8] if previous is not None else 0.0
+                context = 0.48 * (light - global_luminance) + 0.38 * shift + 0.14 * related[cell]
+                source.extend((light, red_blue, green_blue, movement, contour, saturation,
+                               occupied[cell], max(-1.0, min(1.0, context))))
+        for row in range(8):
+            for col in range(8):
+                indices = [y * GW + x for y in range(row * GH // 8, (row + 1) * GH // 8)
+                           for x in range(col * GW // 8, (col + 1) * GW // 8)]
+                scale = 1.0 / max(1, len(indices))
+                values = [luminance_bgr(*rgb[index]) for index in indices]
+                light = sum(values) * scale
+                contrast = sum(abs(value - light) for value in values) * scale
+                source.extend((light, min(1.0, contrast * 2.0),
+                               sum(stabilized_motion[index] for index in indices) * scale,
                                sum(edges[index] for index in indices) * scale))
+        if isinstance(fine_detail, (list, tuple)) and len(fine_detail) == 32:
+            source.extend(max(-1.0, min(1.0, float(value)))
+                          if isinstance(value, (float, int)) and math.isfinite(value) else 0.0
+                          for value in fine_detail)
+        else:
+            source.extend([0.0] * 32)
+        if len(source) != VISUAL_SOURCE_COUNT:
+            raise ValueError('多尺度视觉编码维度错误')
+        self.previous_source = source[:]
+        rate = 0.019 / math.sqrt(1.0 + (self.steps + 1) / 12000.0)
+        if self.np is not None:
+            try:
+                latent, loss = self.accelerated_step(source, rate)
+                self.reconstruction_error = (0.94 * self.reconstruction_error + 0.06 * loss
+                                             if self.steps else loss)
+                self.steps += 1
+                return latent
+            except Exception:
+                self.encoder = self.encoder.tolist() if hasattr(self.encoder, 'tolist') else self.encoder
+                self.decoder = self.decoder.tolist() if hasattr(self.decoder, 'tolist') else self.decoder
+                self.bias = self.bias.tolist() if hasattr(self.bias, 'tolist') else self.bias
+                self.decoder_bias = self.decoder_bias.tolist() if hasattr(self.decoder_bias, 'tolist') else self.decoder_bias
+                self.np = None
         latent = [math.tanh(sum(w * v for w, v in zip(weights, source)) + self.bias[i])
                   for i, weights in enumerate(self.encoder)]
         predicted = [sum(w * h for w, h in zip(weights, latent)) + self.decoder_bias[i]
                      for i, weights in enumerate(self.decoder)]
-        errors = [max(-1.0, min(1.0, v - p)) for v, p in zip(source, predicted)]
-        loss = sum(error * error for error in errors) / 64.0
-        self.reconstruction_error = 0.94 * self.reconstruction_error + 0.06 * loss if self.steps else loss
+        errors = [max(-1.0, min(1.0, value - prediction)) for value, prediction in zip(source, predicted)]
+        loss = sum(error * error for error in errors) / VISUAL_SOURCE_COUNT
+        self.reconstruction_error = (0.94 * self.reconstruction_error + 0.06 * loss
+                                     if self.steps else loss)
         self.steps += 1
-        rate = 0.025 / math.sqrt(1.0 + self.steps / 12000.0)
-        derivatives = [sum(errors[j] * self.decoder[j][i] for j in range(64))
+        rate = 0.019 / math.sqrt(1.0 + self.steps / 12000.0)
+        derivatives = [sum(errors[j] * self.decoder[j][i] for j in range(VISUAL_SOURCE_COUNT))
                        * (1.0 - latent[i] * latent[i]) for i in range(VISUAL_LATENT_COUNT)]
-        for j in range(64):
+        for j in range(VISUAL_SOURCE_COUNT):
             for i in range(VISUAL_LATENT_COUNT):
                 self.decoder[j][i] = max(-1.5, min(1.5, self.decoder[j][i] + rate * errors[j] * latent[i]))
             self.decoder_bias[j] = max(-1.0, min(1.0, self.decoder_bias[j] + rate * errors[j]))
         for i in range(VISUAL_LATENT_COUNT):
-            for j in range(64):
-                self.encoder[i][j] = max(-1.5, min(1.5, self.encoder[i][j] + rate * derivatives[i] * source[j] * 0.25))
-            self.bias[i] = max(-1.0, min(1.0, self.bias[i] + rate * derivatives[i] * 0.25))
+            for j in range(VISUAL_SOURCE_COUNT):
+                self.encoder[i][j] = max(-1.5, min(1.5, self.encoder[i][j] + rate * derivatives[i] * source[j] * 0.18))
+            self.bias[i] = max(-1.0, min(1.0, self.bias[i] + rate * derivatives[i] * 0.18))
         return latent
 
     def learn_transition(self, old, new, action_kind, confidence):
@@ -2274,19 +2618,28 @@ class VisualRepresentation:
             return
         prior = self.action_deltas.get(action_kind, [[0.0] * VISUAL_LATENT_COUNT, 0])
         delta, samples = prior
-        error = sum(abs(max(-1.0, min(1.0, a + d)) - b) for a, b, d in zip(old, new, delta)) / VISUAL_LATENT_COUNT
-        self.transition_error = 0.94 * self.transition_error + 0.06 * error if samples else error
-        rate = min(0.14, confidence * 0.25 / math.sqrt(1.0 + samples * 0.25))
+        residuals = []
         for i in range(VISUAL_LATENT_COUNT):
-            delta[i] = max(-0.8, min(0.8, delta[i] + rate * (new[i] - old[i] - delta[i])))
+            predicted = max(-1.0, min(1.0, old[i] + delta[i]
+                       + sum(weight * state for weight, state in zip(self.transition_weights[i], old))))
+            residuals.append(max(-1.0, min(1.0, new[i] - predicted)))
+        error = sum(abs(value) for value in residuals) / VISUAL_LATENT_COUNT
+        self.transition_error = 0.94 * self.transition_error + 0.06 * error if samples else error
+        rate = min(0.10, confidence * 0.18 / math.sqrt(1.0 + samples * 0.25))
+        for i, residual in enumerate(residuals):
+            delta[i] = max(-0.8, min(0.8, delta[i] + rate * residual * 0.60))
+            for j, value in enumerate(old):
+                adjustment = rate * residual * value * 0.30 / math.sqrt(VISUAL_LATENT_COUNT)
+                self.transition_weights[i][j] = max(-0.4, min(0.4, self.transition_weights[i][j] + adjustment))
         self.action_deltas[action_kind] = [delta, min(1000000, samples + 1)]
         self.action_deltas.move_to_end(action_kind)
         while len(self.action_deltas) > 64:
             self.action_deltas.popitem(last=False)
 
     def export(self):
-        return {'encoder': self.encoder, 'decoder': self.decoder, 'bias': self.bias,
-                'decoder_bias': self.decoder_bias, 'action_deltas': list(self.action_deltas.items()),
+        to_list = lambda values: values.tolist() if hasattr(values, 'tolist') else values
+        return {'encoder': to_list(self.encoder), 'decoder': to_list(self.decoder), 'transition_weights': self.transition_weights,
+                'bias': to_list(self.bias), 'decoder_bias': to_list(self.decoder_bias), 'action_deltas': list(self.action_deltas.items()),
                 'steps': self.steps, 'reconstruction_error': self.reconstruction_error,
                 'transition_error': self.transition_error}
 
@@ -2300,12 +2653,13 @@ class VisualRepresentation:
             if not all(math.isfinite(value) and abs(value) <= 2.0 for value in parsed):
                 raise ValueError('自监督视觉模型存在无效参数')
             return parsed
-        encoder = [finite_vector(row, 64) for row in data.get('encoder', [])]
+        encoder = [finite_vector(row, VISUAL_SOURCE_COUNT) for row in data.get('encoder', [])]
         decoder = [finite_vector(row, VISUAL_LATENT_COUNT) for row in data.get('decoder', [])]
-        if len(encoder) != VISUAL_LATENT_COUNT or len(decoder) != 64:
+        weights = [finite_vector(row, VISUAL_LATENT_COUNT) for row in data.get('transition_weights', [])]
+        if len(encoder) != VISUAL_LATENT_COUNT or len(decoder) != VISUAL_SOURCE_COUNT or len(weights) != VISUAL_LATENT_COUNT:
             raise ValueError('自监督视觉模型矩阵无效')
         bias = finite_vector(data.get('bias'), VISUAL_LATENT_COUNT)
-        decoder_bias = finite_vector(data.get('decoder_bias'), 64)
+        decoder_bias = finite_vector(data.get('decoder_bias'), VISUAL_SOURCE_COUNT)
         action_deltas = OrderedDict()
         for item in data.get('action_deltas', []):
             if isinstance(item, list) and len(item) == 2 and isinstance(item[0], str) and len(item[0]) <= 32:
@@ -2313,7 +2667,10 @@ class VisualRepresentation:
                 if isinstance(values, list) and len(values) == 2:
                     action_deltas[item[0]] = [finite_vector(values[0], VISUAL_LATENT_COUNT),
                                                min(1000000, max(0, int(values[1])))]
-        self.encoder, self.decoder, self.bias, self.decoder_bias = encoder, decoder, bias, decoder_bias
+        self.encoder, self.decoder, self.transition_weights = encoder, decoder, weights
+        self.bias, self.decoder_bias = bias, decoder_bias
+        self.previous_source = None
+        self.temporal_motion = None
         self.action_deltas = OrderedDict(list(action_deltas.items())[-64:])
         self.steps = max(0, int(data.get('steps', 0)))
         self.reconstruction_error = max(0.0, min(2.0, float(data.get('reconstruction_error', 0.0))))
@@ -2381,7 +2738,7 @@ class ReplayStore:
             integrity = self.db.execute('PRAGMA quick_check(1)').fetchone()
             if not integrity or integrity[0] != 'ok':
                 raise sqlite3.DatabaseError('数据库完整性检查失败')
-            self.db.execute("CREATE TABLE IF NOT EXISTS transitions (id INTEGER PRIMARY KEY AUTOINCREMENT, at REAL NOT NULL, game TEXT NOT NULL, action TEXT NOT NULL, reward REAL NOT NULL, before BLOB NOT NULL, after BLOB NOT NULL, change REAL NOT NULL, done INTEGER NOT NULL DEFAULT 0, horizon INTEGER NOT NULL DEFAULT 1, priority REAL NOT NULL DEFAULT 0.1, confidence REAL NOT NULL DEFAULT 0, action_detail TEXT NOT NULL DEFAULT '{}', uid TEXT NOT NULL UNIQUE, feature_version INTEGER NOT NULL DEFAULT 20, signal_kind INTEGER NOT NULL DEFAULT 0, objective_signal REAL NOT NULL DEFAULT 0, information_signal REAL NOT NULL DEFAULT 0, before_frame_uid TEXT NOT NULL DEFAULT '', after_frame_uid TEXT NOT NULL DEFAULT '')")
+            self.db.execute(f"CREATE TABLE IF NOT EXISTS transitions (id INTEGER PRIMARY KEY AUTOINCREMENT, at REAL NOT NULL, game TEXT NOT NULL, action TEXT NOT NULL, reward REAL NOT NULL, before BLOB NOT NULL, after BLOB NOT NULL, change REAL NOT NULL, done INTEGER NOT NULL DEFAULT 0, horizon INTEGER NOT NULL DEFAULT 1, priority REAL NOT NULL DEFAULT 0.1, confidence REAL NOT NULL DEFAULT 0, action_detail TEXT NOT NULL DEFAULT '{{}}', uid TEXT NOT NULL UNIQUE, feature_version INTEGER NOT NULL DEFAULT {MODEL_FORMAT}, signal_kind INTEGER NOT NULL DEFAULT 0, objective_signal REAL NOT NULL DEFAULT 0, information_signal REAL NOT NULL DEFAULT 0, before_frame_uid TEXT NOT NULL DEFAULT '', after_frame_uid TEXT NOT NULL DEFAULT '')")
             required = {'id', 'at', 'game', 'action', 'reward', 'before', 'after', 'change', 'done', 'horizon', 'priority', 'confidence', 'action_detail', 'uid', 'feature_version', 'signal_kind', 'objective_signal', 'information_signal', 'before_frame_uid', 'after_frame_uid'}
             present = {column[1] for column in self.db.execute('PRAGMA table_info(transitions)')}
             if present != required:
@@ -2602,10 +2959,13 @@ class GameData:
         self.control_posteriors = [[1.0, 1.0] for _ in range(count)]
         self.control_head = self.np.zeros((count, DUAL_VALUE_FEATURES), dtype=self.np.float32) if self.np is not None else [[0.0] * DUAL_VALUE_FEATURES for _ in range(count)]
         self.objective_head = self.np.zeros((count, DUAL_VALUE_FEATURES), dtype=self.np.float32) if self.np is not None else [[0.0] * DUAL_VALUE_FEATURES for _ in range(count)]
+        self.information_head = self.np.zeros((count, DUAL_VALUE_FEATURES), dtype=self.np.float32) if self.np is not None else [[0.0] * DUAL_VALUE_FEATURES for _ in range(count)]
         self.control_head_bias = self.np.zeros(count, dtype=self.np.float32) if self.np is not None else [0.0] * count
         self.objective_head_bias = self.np.zeros(count, dtype=self.np.float32) if self.np is not None else [0.0] * count
+        self.information_head_bias = self.np.zeros(count, dtype=self.np.float32) if self.np is not None else [0.0] * count
         self.control_head_samples = [0] * count
         self.objective_head_samples = [0] * count
+        self.information_head_samples = [0] * count
         self.phase_votes = OrderedDict()
         self.feedback_latency_by_kind = OrderedDict()
         self.visits = OrderedDict()
@@ -2633,7 +2993,7 @@ class GameData:
         self.world_action_errors = [0.15] * count
         self.world_action_error_variance = [0.02] * count
         self.world_validation_samples = [0] * count
-        self.diagnostics = {name: 0 for name in ('feedback_actions', 'effect_verified', 'no_effect_verified', 'objective_evidence', 'low_confidence_learning', 'spatial_anchor_samples', 'world_holdout_evaluations', 'transfer_trials', 'transfer_successes', 'control_head_updates', 'objective_head_updates', 'uncertain_action_feedback', 'event_transition_samples', 'first_effect_action', 'effective_controls', 'repeated_ineffective_controls', 'credible_goal_progress', 'uncertain_goal_events', 'causal_profile_samples', 'temporal_prediction_samples', 'skill_intent_remaps', 'validated_world_plans', 'repeatable_effects', 'inverse_dynamics_updates', 'long_horizon_credits', 'condition_error_updates', 'hierarchical_effect_updates', 'goal_candidate_observations', 'goal_candidate_reversals', 'intent_shared_updates', 'predictive_state_evaluations', 'game_profile_switches', 'skill_purpose_confirmations', 'scene_group_holdout_evaluations', 'passive_world_updates', 'passive_world_holdouts', 'objective_context_checks', 'objective_contradictions', 'objective_duplicate_confirmations', 'active_experiment_families', 'contrastive_visual_updates', 'transfer_multistep_trials', 'transfer_multistep_successes', 'replay_counterexamples', 'plan_action_mismatches', 'hierarchical_probe_updates', 'corroborated_progress', 'world_ensemble_diversity', 'skill_feedback_terminations', 'credit_causal_weighted', 'track_recoveries', 'replay_goal_counterexamples', 'supported_subgoal_plans', 'scene_uncertain_horizon_reductions', 'replay_phase_balance_samples', 'uncorroborated_relation_goal_signals', 'transfer_target_control_conflicts', 'joint_decisions', 'joint_candidate_compared', 'visual_stall_penalties', 'goal_evidence_reassessments', 'skill_online_replans', 'temporal_velocity_calibrations', 'adaptive_detail_requests', 'balanced_learning_samples', 'scene_profile_switches_without_game_reset', 'paired_control_comparisons', 'paired_probe_recommendations')}
+        self.diagnostics = {name: 0 for name in ('feedback_actions', 'effect_verified', 'no_effect_verified', 'objective_evidence', 'low_confidence_learning', 'spatial_anchor_samples', 'world_holdout_evaluations', 'transfer_trials', 'transfer_successes', 'control_head_updates', 'objective_head_updates', 'information_head_updates', 'uncertain_action_feedback', 'event_transition_samples', 'first_effect_action', 'effective_controls', 'repeated_ineffective_controls', 'credible_goal_progress', 'uncertain_goal_events', 'causal_profile_samples', 'temporal_prediction_samples', 'skill_intent_remaps', 'validated_world_plans', 'repeatable_effects', 'inverse_dynamics_updates', 'long_horizon_credits', 'condition_error_updates', 'hierarchical_effect_updates', 'goal_candidate_observations', 'goal_candidate_reversals', 'intent_shared_updates', 'predictive_state_evaluations', 'game_profile_switches', 'skill_purpose_confirmations', 'scene_group_holdout_evaluations', 'passive_world_updates', 'passive_world_holdouts', 'objective_context_checks', 'objective_contradictions', 'objective_duplicate_confirmations', 'active_experiment_families', 'contrastive_visual_updates', 'transfer_multistep_trials', 'transfer_multistep_successes', 'replay_counterexamples', 'plan_action_mismatches', 'hierarchical_probe_updates', 'corroborated_progress', 'world_ensemble_diversity', 'skill_feedback_terminations', 'credit_causal_weighted', 'track_recoveries', 'replay_goal_counterexamples', 'supported_subgoal_plans', 'scene_uncertain_horizon_reductions', 'replay_phase_balance_samples', 'uncorroborated_relation_goal_signals', 'transfer_target_control_conflicts', 'joint_decisions', 'joint_candidate_compared', 'visual_stall_penalties', 'goal_evidence_reassessments', 'skill_online_replans', 'temporal_velocity_calibrations', 'adaptive_detail_requests', 'balanced_learning_samples', 'scene_profile_switches_without_game_reset', 'paired_control_comparisons', 'paired_probe_recommendations', 'world_transfer_bootstraps', 'world_transfer_visual_matches', 'temporal_forecast_updates', 'temporal_forecast_calibrations', 'rejected_proxy_goals', 'parameter_trials', 'plan_root_diversity', 'skill_transfer_context_checks', 'sequential_replay_samples', 'screen_correlated_control_responses', 'camera_only_exploration_penalties', 'online_replan_horizon_reductions')}
         self.transfer_skill_stats = OrderedDict()
         self.prediction_error_mean = 0.11
         self.prediction_error_variance = 0.0009
@@ -2685,6 +3045,7 @@ class GameData:
         self.parameter_heads = {}
         self.goal_landmarks = OrderedDict()
         self.hud_trends = OrderedDict()
+        self.temporal_predictors = OrderedDict()
         self.goal_hypotheses = OrderedDict()
         self.goal_context_support = OrderedDict()
         self.goal_evidence = deque(maxlen=24)
@@ -2811,7 +3172,7 @@ class GameData:
             if right_goal:
                 self.action_goal[i] = (self.action_goal[i] * left_goal + other.action_goal[i] * right_goal) / (left_goal + right_goal)
                 self.action_goal_samples[i] = min(1000000000, left_goal + right_goal)
-            for name in ('control', 'objective'):
+            for name in ('control', 'objective', 'information'):
                 samples = getattr(self, name + '_head_samples')
                 additional = getattr(other, name + '_head_samples')[i]
                 if additional:
@@ -2979,6 +3340,13 @@ class GameData:
             self.phase_votes.move_to_end(key)
         while len(self.phase_votes) > 800:
             self.phase_votes.popitem(last=False)
+        for context, incoming in other.temporal_predictors.items():
+            local = self.temporal_predictors.get(context)
+            if local is None or int(incoming[6]) > int(local[6]):
+                self.temporal_predictors[context] = list(incoming)
+                self.temporal_predictors.move_to_end(context)
+        while len(self.temporal_predictors) > 192:
+            self.temporal_predictors.popitem(last=False)
         for kind, record in other.feedback_latency_by_kind.items():
             previous = self.feedback_latency_by_kind.get(kind)
             if previous is None:
@@ -3298,10 +3666,13 @@ class GameData:
             'control_posteriors': self.control_posteriors,
             'control_head': self.control_head.tolist() if self.np is not None else self.control_head,
             'objective_head': self.objective_head.tolist() if self.np is not None else self.objective_head,
+            'information_head': self.information_head.tolist() if self.np is not None else self.information_head,
             'control_head_bias': self.control_head_bias.tolist() if self.np is not None else self.control_head_bias,
             'objective_head_bias': self.objective_head_bias.tolist() if self.np is not None else self.objective_head_bias,
+            'information_head_bias': self.information_head_bias.tolist() if self.np is not None else self.information_head_bias,
             'control_head_samples': self.control_head_samples,
             'objective_head_samples': self.objective_head_samples,
+            'information_head_samples': self.information_head_samples,
             'phase_votes': list(self.phase_votes.items())[-800:],
             'feedback_latency_by_kind': list(self.feedback_latency_by_kind.items())[-96:],
             'visits': list(self.visits.items()),
@@ -3367,6 +3738,7 @@ class GameData:
                                        'b': head['b'].tolist() if self.np is not None else head['b'],
                                        'samples': head['samples']} for kind, head in self.parameter_heads.items()},
             'goal_landmarks': list(self.goal_landmarks.items())[-800:],
+            'temporal_predictors': list(self.temporal_predictors.items())[-192:],
             'hud_trends': list(self.hud_trends.items())[-160:],
             'goal_hypotheses': list(self.goal_hypotheses.items())[-160:],
             'goal_context_support': list(self.goal_context_support.items())[-320:],
@@ -3456,7 +3828,8 @@ class Brain:
             scale = sum(weight for weight, _ in top) or 1.0
             self.action_neighbors.append([(j, weight / scale) for weight, j in top])
         self.hidden_size = MODEL_HIDDEN_SIZE
-        self.vision_model = VisualRepresentation()
+        self.vision_model = VisualRepresentation(self.cv_np)
+        self.transfer_probes = deque(maxlen=24)
         self.rng = random.Random()
         self.encoder = [[self.rng.uniform(-0.035, 0.035) for _ in range(FEATURE_COUNT)] for _ in range(self.hidden_size)]
         self.encoder_bias = [0.0] * self.hidden_size
@@ -3500,6 +3873,7 @@ class Brain:
         self.last_change = 0.0
         self.last_frame = None
         self.last_detail = [0.0] * 20
+        self.last_detail_maps = ([0.0] * 16, [0.0] * 16)
         self.detail_region_memory = OrderedDict()
         self.last_detail_focus = (0.5, 0.5)
         self.last_detail_location = (0.5, 0.5)
@@ -3784,31 +4158,12 @@ class Brain:
         with self.lock:
             if key not in self.games:
                 newcomer = GameData(len(self.actions), self.hidden_size, self.np)
-                reliable = [item for item in self.games.values()
-                            if item.world_network is not None and item.world_network_steps >= 120
-                            and item.prediction_error_samples >= 40
-                            and item.prediction_error_mean + 1.5 * math.sqrt(max(0.0, item.prediction_error_variance)) < 0.095
-                            and sum(item.world_validation_samples) >= 30]
-                if reliable:
-                    teacher = min(reliable, key=lambda item: item.prediction_error_mean + math.sqrt(max(0.0, item.prediction_error_variance)))
-                    target = newcomer.ensure_world_network()
-                    for name, original in teacher.world_network.items():
-                        if name not in target:
-                            continue
-                        if self.np is not None:
-                            target[name] = 0.72 * original.copy() + 0.28 * target[name]
-                        else:
-                            prior = target[name]
-                            target[name] = ([0.72 * float(old) + 0.28 * float(now) for old, now in zip(original, prior)]
-                                            if name.startswith('b') else
-                                            [[0.72 * float(old) + 0.28 * float(now) for old, now in zip(row_old, row_new)]
-                                             for row_old, row_new in zip(original, prior)])
-                    newcomer.diagnostics['world_transfer_bootstraps'] = 1
                 self.games[key] = newcomer
                 self.dirty_games.add(key)
                 self.dirty_sequence += 1
             if self.game_key != key:
                 self.flush_pending(done=False)
+                self.vision_model.previous_source = None
                 self.previous_lum = None
                 self.previous_motion = None
                 self.track_last_time = None
@@ -3825,6 +4180,7 @@ class Brain:
                 self.visual_tracks.clear()
                 self.control_scores.clear()
                 self.outcome_trace.clear()
+                self.transfer_probes.clear()
             self.game_key = key
             self.last_skill_source = None
             self.last_transfer_key = None
@@ -3834,6 +4190,91 @@ class Brain:
             self.last_plan_predictions = []
             self.choice_parameters = None
             self.belief_history.clear()
+
+    def bootstrap_world_from_similar_game(self, fingerprint):
+        game = self.game
+        if (game.world_network_steps >= 48 or game.game_steps > 160
+                or getattr(game, 'world_transfer_checked', False)):
+            return False
+        if len(self.transfer_probes) < 6:
+            return False
+        if len({item[1] for item in self.transfer_probes}) < 2:
+            return False
+        matches = []
+        for source_key, source in self.games.items():
+            if source is game or source.world_network is None or source.world_network_steps < 120:
+                continue
+            if source.prediction_error_samples < 40 or sum(source.world_validation_samples) < 30:
+                continue
+            validated_error = source.prediction_error_mean + 1.5 * math.sqrt(max(0.0, source.prediction_error_variance))
+            if validated_error >= 0.095:
+                continue
+            nearest = min((sum(abs(float(x) - float(y)) for x, y in zip(fingerprint, center)) / len(fingerprint)
+                           for center, _ in list(source.scene_centers.values())[-48:]
+                           if len(center) == len(fingerprint)), default=100.0)
+            if nearest >= 0.40:
+                continue
+            errors, baselines, seen_actions = [], [], set()
+            for features, index, parameters, target in self.transfer_probes:
+                if source.world_action_samples[index] < 5:
+                    continue
+                forecast = self._predict_learned_world(source, index, features, parameters)
+                if forecast is None:
+                    continue
+                predicted = forecast[0]
+                error = self.world_error(predicted, target)
+                zero_error = self.world_error([0.0] * WORLD_FEATURE_COUNT, target)
+                if not math.isfinite(error) or not math.isfinite(zero_error):
+                    continue
+                errors.append(error)
+                baselines.append(zero_error)
+                seen_actions.add(self.action_intents[index])
+            if len(errors) < 5 or len(seen_actions) < 2:
+                continue
+            prediction_error = sum(errors) / len(errors)
+            baseline_error = sum(baselines) / len(baselines)
+            if prediction_error >= 0.11 or prediction_error >= baseline_error * 0.82:
+                game.diagnostics['world_transfer_rejected_on_target_feedback'] = game.diagnostics.get('world_transfer_rejected_on_target_feedback', 0) + 1
+                continue
+            matches.append((prediction_error + nearest * 0.12, nearest, prediction_error,
+                            baseline_error, source_key, source))
+        if not matches:
+            if game.game_steps >= 120 or len(self.transfer_probes) >= 20:
+                game.world_transfer_checked = True
+            return False
+        _, visual_distance, prediction_error, baseline_error, _, source = min(matches, key=lambda entry: entry[0])
+        improvement = max(0.0, (baseline_error - prediction_error) / max(0.005, baseline_error))
+        transfer_strength = min(0.22, 0.28 * improvement * max(0.0, 1.0 - visual_distance / 0.40))
+        if transfer_strength < 0.025:
+            game.world_transfer_checked = True
+            return False
+        target = game.ensure_world_network()
+        for name, original in source.world_network.items():
+            if name not in target:
+                continue
+            if self.np is not None:
+                blended = transfer_strength * original.copy() + (1.0 - transfer_strength) * target[name]
+                if name in ('w2', 'w2_alt', 'b2', 'b2_alt'):
+                    blended[-1] = target[name][-1]
+                target[name] = blended
+            else:
+                prior = target[name]
+                if name.startswith('b'):
+                    target[name] = [float(now) if name in ('b2', 'b2_alt') and i == len(prior) - 1
+                                    else transfer_strength * float(old) + (1.0 - transfer_strength) * float(now)
+                                    for i, (old, now) in enumerate(zip(original, prior))]
+                else:
+                    target[name] = [[float(now) if name in ('w2', 'w2_alt') and i == len(prior) - 1
+                                     else transfer_strength * float(old) + (1.0 - transfer_strength) * float(now)
+                                     for old, now in zip(row_old, row_new)]
+                                    for i, (row_old, row_new) in enumerate(zip(original, prior))]
+        game.world_transfer_checked = True
+        game.diagnostics['world_transfer_effective_strength'] = round(transfer_strength, 6)
+        game.diagnostics['world_transfer_target_prediction_error'] = round(prediction_error, 6)
+        game.diagnostics['world_transfer_target_baseline_error'] = round(baseline_error, 6)
+        game.diagnostics['world_transfer_bootstraps'] = game.diagnostics.get('world_transfer_bootstraps', 0) + 1
+        game.diagnostics['world_transfer_visual_matches'] = game.diagnostics.get('world_transfer_visual_matches', 0) + 1
+        return True
 
     @staticmethod
     def regional_rgb_motion(before, after):
@@ -4089,6 +4530,54 @@ class Brain:
         belief = {'scene': scene, 'time': now, 'phase': predicted_phase, 'phase_confidence': phase_strength,
                   'player': player, 'relative': relative, 'target_candidates': target_candidates, 'meters': meters, 'interval': interval,
                   'confidence': max(0.0, min(1.0, confidence)), 'frames': min(18, len(history) + 1)}
+        game = self.game
+        model = game.temporal_predictors.get(scene)
+        continuous = bool(previous and player and previous.get('player')
+                          and previous['player'][0] == player[0]
+                          and now - previous['time'] <= 1.8
+                          and player[5] >= 0.30 and previous['player'][5] >= 0.30)
+        if model is not None and model[6] >= 3 and continuous:
+            confidence_model = (min(0.88, model[6] / (model[6] + 7.0))
+                                * math.exp(-2.8 * max(0.0, model[4])) * belief['confidence'])
+            if confidence_model >= 0.12:
+                projected = (max(0.0, min(1.0, player[1] + model[0] * interval)),
+                             max(0.0, min(1.0, player[2] + model[1] * interval)))
+                belief['forecast_player'] = projected
+                belief['forecast_closing'] = model[2]
+                belief['forecast_meter_change'] = model[3] * interval
+                belief['forecast_confidence'] = confidence_model
+                observation.temporal_summary['predicted_closing'] = round(model[2], 4)
+                game.diagnostics['temporal_forecast_calibrations'] += 1
+        if continuous:
+            old_player = previous['player']
+            prior_relative = previous.get('relative')
+            shared_relative = bool(relative and prior_relative and relative[0] == prior_relative[0])
+            common_meters = [key for key in meters if key in previous.get('meters', {})]
+            measured = [max(-2.0, min(2.0, (player[1] - old_player[1]) / interval)),
+                        max(-2.0, min(2.0, (player[2] - old_player[2]) / interval)),
+                        max(-2.0, min(2.0, (prior_relative[3] - relative[3]) / interval)) if shared_relative else 0.0,
+                        max(-2.0, min(2.0, sum(meters[key] - previous['meters'][key] for key in common_meters)
+                                             / (len(common_meters) * interval))) if common_meters else 0.0]
+            if model is None:
+                model = measured[:] + [0.0, 0.0, 1]
+            else:
+                innovation = sum(abs(a - b) for a, b in zip(measured, model[:4])) / 4.0
+                count = max(1, int(model[6]))
+                learning_rate = max(0.06, min(0.28, belief['confidence'] * 0.32))
+                if not shared_relative:
+                    learning_rate *= 0.70
+                model[4] = 0.88 * model[4] + 0.12 * innovation
+                model[5] = 0.90 * model[5] + 0.10 * abs(innovation - model[4])
+                for k, value in enumerate(measured):
+                    if k == 2 and not shared_relative or k == 3 and not common_meters:
+                        continue
+                    model[k] += learning_rate * (value - model[k])
+                model[6] = min(1000000, count + 1)
+            game.temporal_predictors[scene] = model
+            game.temporal_predictors.move_to_end(scene)
+            while len(game.temporal_predictors) > 192:
+                game.temporal_predictors.popitem(last=False)
+            game.diagnostics['temporal_forecast_updates'] += 1
         observation.belief_state = belief
         observation.temporal_summary['belief_confidence'] = round(belief['confidence'], 4)
         observation.temporal_summary['target_closing'] = round(relative[4], 4) if relative else 0.0
@@ -4298,6 +4787,7 @@ class Brain:
                 pooled = [sum(weight * values[j] for weight, values in weighted) / total for j in range(4)]
                 sections = [0.60 * local + 0.40 * global_value for local, global_value in zip(sections, pooled)]
             self.last_detail = samples + sections
+            self.last_detail_maps = (samples[:], texture[:])
             self.last_detail_step = self.step
         if self.last_detail_step is None:
             return self.last_detail + [0.5, 0.5, 1.0, 0.0]
@@ -4611,9 +5101,12 @@ class Brain:
         belief = getattr(obs, 'belief_state', {})
         stable_relative = belief.get('relative') if belief.get('frames', 0) >= 2 and belief.get('confidence', 0.0) >= 0.48 else None
         if stable_relative is not None and stable_relative[5] >= 0.30:
+            predicted_closing = float(belief.get('forecast_closing', stable_relative[4]))
+            forecast_weight = min(0.55, float(belief.get('forecast_confidence', 0.0)))
+            closing = stable_relative[4] * (1.0 - forecast_weight) + predicted_closing * forecast_weight
             relative = [max(-1.0, min(1.0, stable_relative[1])),
                         max(-1.0, min(1.0, stable_relative[2])),
-                        max(-1.0, min(1.0, stable_relative[4] * 4.0)),
+                        max(-1.0, min(1.0, closing * 4.0)),
                         1.0 / (1.0 + stable_relative[3] * 6.0)]
         result.extend((min(1.0, float(temporal.get('motion_average', temporal.get('motion_energy', 0.0))) * 5.0),
                        max(-1.0, min(1.0, float(temporal.get('motion_trend', 0.0)) * 6.0)),
@@ -4862,7 +5355,7 @@ class Brain:
         return (width / GW, height / GH, len(members) / max(1, width * height),
                 max(0.0, min(1.0, width / max(1, height) / 5.0)))
 
-    def observe(self, raw, rect, detail=None):
+    def observe(self, raw, rect, detail=None, detail_extras=None):
         vision_started = time.perf_counter()
         try:
             rgb = self.rgb_blocks(raw)
@@ -4872,6 +5365,12 @@ class Brain:
         if detail is not None and len(detail) != DW * DH * 4:
             self.invalid_observations += 1
             detail = None
+        detail_extras = [(data, focus) for data, focus in (detail_extras or ())[:2]
+                         if isinstance(focus, (tuple, list)) and len(focus) == 2
+                         and data is not None and len(data) == DW * DH * 4
+                         and all(isinstance(value, (int, float)) and math.isfinite(value) for value in focus)]
+        if detail is None:
+            detail_extras = []
         count = GW * GH
         lum = [luminance_bgr(b, g, r) for b, g, r in rgb]
         motion = [abs(v - p) for v, p in zip(lum, self.previous_lum)] if self.previous_lum is not None else [0.0] * count
@@ -4923,6 +5422,8 @@ class Brain:
                     fingerprint.append(max(0, min(11, int(12 * amount))))
         signature = hashlib.blake2b(bytes(fingerprint), digest_size=8).hexdigest()
         with self.lock:
+            if not low_information:
+                self.bootstrap_world_from_similar_game(fingerprint)
             nearest = None
             distance = 1000.0
             for old_signature, (center, _) in list(game.scene_centers.items())[-96:]:
@@ -4979,6 +5480,14 @@ class Brain:
                 x0, x1 = col * GW // 8, (col + 1) * GW // 8
                 ids = [r * GW + c for r in range(row * 3, (row + 1) * 3) for c in range(x0, x1)]
                 features.append(sum(lum[i] for i in ids) / max(1, len(ids)))
+        if detail_extras:
+            primary_detail_focus = self.last_detail_focus
+            try:
+                for auxiliary_detail, auxiliary_focus in detail_extras:
+                    self.last_detail_focus = tuple(auxiliary_focus)
+                    self.detail_features(auxiliary_detail)
+            finally:
+                self.last_detail_focus = primary_detail_focus
         detail_vector = self.detail_features(detail)
         features.extend(detail_vector)
         features.extend(((max_s % GW + 0.5) / GW, (max_s // GW + 0.5) / GH))
@@ -5025,6 +5534,7 @@ class Brain:
             self.temporal_luma.clear()
             self.previous_lum = None
             self.previous_motion = None
+            self.vision_model.previous_source = None
             self.last_change = 0.0
         else:
             self.temporal_luma.append(lum[:])
@@ -5067,68 +5577,69 @@ class Brain:
         observation.ui_text = self.read_ui_symbols(raw) if not low_information else []
         observation.ui_shapes = [dict(item) for item in self.last_unknown_shapes] if not low_information else []
         if not low_information and detail is not None:
-            def detail_patch(left, top, width, height):
-                if width == W and height == H:
-                    return b''.join(detail[((top + y) * DW + left) * 4:
-                                           ((top + y) * DW + left + W) * 4] for y in range(H))
-                small = bytearray(W * H * 4)
-                for y in range(H):
-                    source_y = min(DH - 1, top + y * height // H)
-                    output = y * W * 4
-                    input_row = source_y * DW * 4
-                    for x in range(W):
-                        sample = input_row + min(DW - 1, left + x * width // W) * 4
-                        small[output + x * 4:output + x * 4 + 4] = detail[sample:sample + 4]
-                return bytes(small)
-            region_width = min(rect[2], max(96, int(rect[2] * 0.38)))
-            region_height = min(rect[3], max(96, int(rect[3] * 0.38)))
-            fx, fy = self.last_detail_focus
-            offset_x = max(0, min(rect[2] - region_width, int(fx * rect[2] - region_width * 0.5)))
-            offset_y = max(0, min(rect[3] - region_height, int(fy * rect[3] - region_height * 0.5)))
-            crops = [(0, 0, DW, DH)]
-            half_w, half_h = DW // 2, DH // 2
-            index = self.step % 4
-            crops.append(((index % 2) * half_w, (index // 2) * half_h, half_w, half_h))
-            tile = self.step % 9
-            crops.append(((tile % 3) * W, (tile // 3) * H, W, H))
-            uncertain_text = [item for item in observation.ui_text
-                              if float(item.get('confidence', 0.0)) >= 0.73]
-            if uncertain_text:
-                focus_text = min(uncertain_text, key=lambda item: float(item.get('temporal_confidence', item.get('confidence', 0.0))))
-                local_x = (float(focus_text['x']) * rect[2] - offset_x) / max(1, region_width)
-                local_y = (float(focus_text['y']) * rect[3] - offset_y) / max(1, region_height)
-                if 0.0 <= local_x <= 1.0 and 0.0 <= local_y <= 1.0:
+            for detail_frame, detail_focus_point in [(detail, self.last_detail_focus), *detail_extras]:
+                def detail_patch(left, top, width, height):
+                    if width == W and height == H:
+                        return b''.join(detail_frame[((top + y) * DW + left) * 4:
+                                               ((top + y) * DW + left + W) * 4] for y in range(H))
+                    small = bytearray(W * H * 4)
+                    for y in range(H):
+                        source_y = min(DH - 1, top + y * height // H)
+                        output = y * W * 4
+                        input_row = source_y * DW * 4
+                        for x in range(W):
+                            sample = input_row + min(DW - 1, left + x * width // W) * 4
+                            small[output + x * 4:output + x * 4 + 4] = detail_frame[sample:sample + 4]
+                    return bytes(small)
+                region_width = min(rect[2], max(96, int(rect[2] * 0.38)))
+                region_height = min(rect[3], max(96, int(rect[3] * 0.38)))
+                fx, fy = detail_focus_point
+                offset_x = max(0, min(rect[2] - region_width, int(fx * rect[2] - region_width * 0.5)))
+                offset_y = max(0, min(rect[3] - region_height, int(fy * rect[3] - region_height * 0.5)))
+                crops = [(0, 0, DW, DH)]
+                half_w, half_h = DW // 2, DH // 2
+                index = self.step % 4
+                crops.append(((index % 2) * half_w, (index // 2) * half_h, half_w, half_h))
+                tile = self.step % 9
+                crops.append(((tile % 3) * W, (tile // 3) * H, W, H))
+                uncertain_text = [item for item in observation.ui_text
+                                  if float(item.get('confidence', 0.0)) >= 0.73]
+                if uncertain_text:
+                    focus_text = min(uncertain_text, key=lambda item: float(item.get('temporal_confidence', item.get('confidence', 0.0))))
+                    local_x = (float(focus_text['x']) * rect[2] - offset_x) / max(1, region_width)
+                    local_y = (float(focus_text['y']) * rect[3] - offset_y) / max(1, region_height)
+                    if 0.0 <= local_x <= 1.0 and 0.0 <= local_y <= 1.0:
+                        sub_w, sub_h = DW // 3, DH // 3
+                        crops.append((max(0, min(DW - sub_w, int(local_x * DW - sub_w * 0.5))),
+                                      max(0, min(DH - sub_h, int(local_y * DH - sub_h * 0.5))), sub_w, sub_h))
+                elif self.step % 3 == 1:
                     sub_w, sub_h = DW // 3, DH // 3
-                    crops.append((max(0, min(DW - sub_w, int(local_x * DW - sub_w * 0.5))),
-                                  max(0, min(DH - sub_h, int(local_y * DH - sub_h * 0.5))), sub_w, sub_h))
-            elif self.step % 3 == 1:
-                sub_w, sub_h = DW // 3, DH // 3
-                crops.append((max(0, min(DW - sub_w, (index % 3) * sub_w)),
-                              max(0, min(DH - sub_h, (index // 2) * sub_h)), sub_w, sub_h))
-            for left, top, width, height in crops:
-                patch_symbols = self.read_ui_symbols(detail_patch(left, top, width, height))
-                for shape in self.last_unknown_shapes:
-                    u = (left + float(shape['x']) * width) / DW
-                    v = (top + float(shape['y']) * height) / DH
-                    mapped = dict(shape)
-                    mapped['x'] = max(0.0, min(1.0, (offset_x + u * region_width) / max(1, rect[2])))
-                    mapped['y'] = max(0.0, min(1.0, (offset_y + v * region_height) / max(1, rect[3])))
-                    mapped['source'] = 'detail'
-                    observation.ui_shapes.append(mapped)
-                for item in patch_symbols:
-                    u = (left + item['x'] * width) / DW
-                    v = (top + item['y'] * height) / DH
-                    absolute_x = (offset_x + u * region_width) / max(1, rect[2])
-                    absolute_y = (offset_y + v * region_height) / max(1, rect[3])
-                    if not any(existing['text'] == item['text'] and abs(existing['x'] - absolute_x) < 0.025 and abs(existing['y'] - absolute_y) < 0.025 for existing in observation.ui_text):
-                        shifted = dict(item)
-                        bounds = item.get('bounds')
-                        if isinstance(bounds, list) and len(bounds) == 4:
-                            shifted['bounds'] = [max(0.0, min(1.0, (offset_x + (left + bounds[k] * width) * region_width / DW) / max(1, rect[2])))
-                                                 if k % 2 == 0 else max(0.0, min(1.0, (offset_y + (top + bounds[k] * height) * region_height / DH) / max(1, rect[3])))
-                                                 for k in range(4)]
-                        shifted.update({'x': absolute_x, 'y': absolute_y, 'source': 'detail'})
-                        observation.ui_text.append(shifted)
+                    crops.append((max(0, min(DW - sub_w, (index % 3) * sub_w)),
+                                  max(0, min(DH - sub_h, (index // 2) * sub_h)), sub_w, sub_h))
+                for left, top, width, height in crops:
+                    patch_symbols = self.read_ui_symbols(detail_patch(left, top, width, height))
+                    for shape in self.last_unknown_shapes:
+                        u = (left + float(shape['x']) * width) / DW
+                        v = (top + float(shape['y']) * height) / DH
+                        mapped = dict(shape)
+                        mapped['x'] = max(0.0, min(1.0, (offset_x + u * region_width) / max(1, rect[2])))
+                        mapped['y'] = max(0.0, min(1.0, (offset_y + v * region_height) / max(1, rect[3])))
+                        mapped['source'] = 'detail'
+                        observation.ui_shapes.append(mapped)
+                    for item in patch_symbols:
+                        u = (left + item['x'] * width) / DW
+                        v = (top + item['y'] * height) / DH
+                        absolute_x = (offset_x + u * region_width) / max(1, rect[2])
+                        absolute_y = (offset_y + v * region_height) / max(1, rect[3])
+                        if not any(existing['text'] == item['text'] and abs(existing['x'] - absolute_x) < 0.025 and abs(existing['y'] - absolute_y) < 0.025 for existing in observation.ui_text):
+                            shifted = dict(item)
+                            bounds = item.get('bounds')
+                            if isinstance(bounds, list) and len(bounds) == 4:
+                                shifted['bounds'] = [max(0.0, min(1.0, (offset_x + (left + bounds[k] * width) * region_width / DW) / max(1, rect[2])))
+                                                     if k % 2 == 0 else max(0.0, min(1.0, (offset_y + (top + bounds[k] * height) * region_height / DH) / max(1, rect[3])))
+                                                     for k in range(4)]
+                            shifted.update({'x': absolute_x, 'y': absolute_y, 'source': 'detail'})
+                            observation.ui_text.append(shifted)
             observation.ui_text.sort(key=lambda item: item['confidence'], reverse=True)
             observation.ui_text = observation.ui_text[:36]
             retained_shapes = []
@@ -5348,12 +5859,22 @@ class Brain:
         else:
             phase_gap = 0.42 * (1.0 - observation.phase_confidence) + 0.28 * (1.0 - max(text_reliability, shape_reliability * 0.65))
             phase_gap += 0.30 * (1.0 - max(player_reliability, float(belief.get('confidence', 0.0))))
+        forecast_trust = float(belief.get('forecast_confidence', 0.0))
         observation.state_uncertainty = max(0.0, min(1.0,
-            0.77 * phase_gap + 0.23 * (1.0 - float(observation.quality.get('confidence', 0.0)))))
+            (0.77 * phase_gap + 0.23 * (1.0 - float(observation.quality.get('confidence', 0.0))))
+            * (1.0 - 0.16 * forecast_trust)))
         observation.quality['state_uncertainty'] = round(observation.state_uncertainty, 4)
         observation.features[SEMANTIC_START:VISUAL_LATENT_START] = self.semantic_features(observation)
         with self.lock:
-            observation.features[VISUAL_LATENT_START:] = self.vision_model.observe(rgb, motion, edges)
+            detail_age = max(0, self.step - self.last_detail_step) if self.last_detail_step is not None else 1000
+            detail_trust = 1.0 / (1.0 + detail_age * 0.40) if detail_age <= 18 else 0.0
+            fine_detail = ([(min(1.0, max(0.0, value)) - 0.5) * 2.0 * detail_trust
+                            for value in self.last_detail_maps[0]]
+                           + [min(1.0, max(0.0, value * 2.5)) * detail_trust
+                              for value in self.last_detail_maps[1]])
+            observation.features[VISUAL_LATENT_START:] = self.vision_model.observe(
+                rgb, motion, edges, observation.objects, observation.object_relations, fine_detail,
+                observation.camera_motion)
             observation.quality['learned_visual_reconstruction_error'] = round(self.vision_model.reconstruction_error, 6)
         observed_cost = max(0.0, min(10.0, time.perf_counter() - vision_started))
         self.vision_cost_ema = (0.84 * self.vision_cost_ema + 0.16 * observed_cost
@@ -5468,6 +5989,12 @@ class Brain:
         keys = ['a:' + identifier,
                 self.experiment_context(obs) + ':' + identifier,
                 's:' + self.state_signature(obs) + ':' + identifier]
+        if self.actions[index].kind == 'compose' and isinstance(parameters, dict):
+            codes = [int(parameters.get(name) or 0) for name in ('a', 'b', 'c')]
+            if all(not code or 8 <= code <= 254 and not stop_equivalent(code, self.stop_vk) for code in codes):
+                composition = ':'.join(map(str, codes)) + ':' + str(int(bool(parameters.get('composed_mouse'))))
+                keys.append('compose:' + composition)
+                keys.append(self.experiment_context(obs) + ':compose:' + composition)
         if isinstance(parameters, dict) and parameters.get('spatial'):
             try:
                 x = float(parameters.get('start_x', parameters.get('x', 0.5)))
@@ -5716,7 +6243,8 @@ class Brain:
             ('move', 'swipe', 'right_swipe', 'look', 'wheel', 'touch_swipe', 'pinch'),
             ('combat', 'aim', 'move_fire', 'dual_touch'),
         )]
-        keys = (int(normalized('a', action.a)), int(normalized('b', action.b))) if kind == 'compose' else (action.a, action.b)
+        keys = (int(normalized('a', action.a)), int(normalized('b', action.b)),
+                int(normalized('c', 0))) if kind == 'compose' else (action.a, action.b)
         horizontal = (int(68 in keys or 39 in keys) - int(65 in keys or 37 in keys))
         vertical = (int(83 in keys or 40 in keys) - int(87 in keys or 38 in keys))
         if kind in ('swipe', 'right_swipe', 'touch_swipe', 'dual_touch', 'look'):
@@ -5733,7 +6261,8 @@ class Brain:
                   float(kind in ('wheel', 'pinch')),
                   float(kind in ('touch_tap', 'touch_swipe', 'pinch', 'dual_touch')),
                   float(keys[0]) / 255.0 if 0 <= keys[0] <= 255 else 0.0,
-                  float(keys[1]) / 255.0 if 0 <= keys[1] <= 255 else 0.0]
+                  (float(keys[1]) + (0.25 * float(keys[2]) if len(keys) > 2 else 0.0)) / 318.75
+                  if 0 <= keys[1] <= 255 else 0.0]
         coding = codes + [2.0 * max(0.0, min(1.0, normalized('start_x', normalized('x', action.x)))) - 1.0,
                           2.0 * max(0.0, min(1.0, normalized('start_y', normalized('y', action.y)))) - 1.0,
                           max(0.0, min(1.0, normalized('requested_duration', normalized('duration', action.duration)) / 1.5)),
@@ -6419,7 +6948,7 @@ class Brain:
                     bonus += 0.05 / math.sqrt(1.0 + local_trials)
         return min(0.35, bonus)
 
-    def matched_experiment_bonus(self, game, obs, index, phase):
+    def matched_experiment_bonus(self, game, obs, index, phase, family_tests=None):
         if phase == 'policy':
             return 0.0
         family = self.family_for_action[index]
@@ -6429,21 +6958,30 @@ class Brain:
         context = self.experiment_context(obs)
         own = game.action_applicability.get(context + ':' + str(index))
         attempts = max(0, int(own[0])) if own else 0
-        tested = []
-        for alternative in peers:
-            if alternative == index:
-                continue
-            trial = game.action_applicability.get(context + ':' + str(alternative))
-            if trial and trial[0] >= 2:
-                tested.append((trial[0], float(trial[1]), float(trial[3])))
-        if not tested:
+        if family_tests is not None:
+            tests = family_tests.get(family, ())
+        else:
+            tests = [(alternative, trial) for alternative in peers
+                     if alternative != index
+                     for trial in [game.action_applicability.get(context + ':' + str(alternative))]
+                     if trial and trial[0] >= 2]
+        if not tests:
             return 0.0
-        contrast = max(max(0.0, effect - 0.4 * failure) for _, effect, failure in tested)
+        if family_tests is not None:
+            largest, second, total = tests
+            chosen = second if largest[1] == index else largest
+            if chosen[1] == index or chosen[1] < 0:
+                return 0.0
+            contrast = chosen[0]
+            relevant = total - (min(12, own[0]) if own and own[0] >= 2 else 0)
+        else:
+            contrast = max(max(0.0, float(trial[1]) - 0.4 * float(trial[3])) for _, trial in tests)
+            relevant = sum(min(12, trial[0]) for _, trial in tests)
         if attempts >= 3 and own is not None:
             own_effect = float(own[1]) - 0.4 * float(own[3])
             if abs(contrast - own_effect) < 0.08:
                 return 0.0
-        evidence = min(1.0, sum(min(12, trial[0]) for trial in tested) / 16.0)
+        evidence = min(1.0, relevant / 16.0)
         passive = game.passive_scenes.get('context:' + context)
         natural_motion = max(0.0, float(passive[0])) if passive is not None else 0.0
         trust = max(0.35, 1.0 - 2.5 * natural_motion)
@@ -6461,6 +6999,21 @@ class Brain:
                        0.65 * obs.phase_confidence if obs.phase == 'playing' else 0.0)
         scores = []
         guidance = self.discovery_guidance(game, obs, phase, family_attempts)
+        kinds_control = {(family, kind): self.hierarchical_control_prediction(game, obs, indices[0])
+                         for (family, kind), indices in self.action_kinds.items()}
+        intent_transfer = {}
+        family_tests = {}
+        for family, indices in self.action_families.items():
+            tested = []
+            total = 0
+            for i in indices:
+                trial = game.action_applicability.get(state_key + ':' + str(i))
+                if trial and trial[0] >= 2:
+                    tested.append((max(0.0, float(trial[1]) - 0.4 * float(trial[3])), i))
+                    total += min(12, int(trial[0]))
+            tested.sort(reverse=True)
+            if tested:
+                family_tests[family] = (tested[0], tested[1] if len(tested) >= 2 else (-1.0, -1), total)
         for i, action in enumerate(self.actions):
             record = game.action_applicability.get(state_key + ':' + str(i))
             count, effect, reward, failure = record if record is not None else (0, 0.0, 0.0, 0.0)
@@ -6522,10 +7075,13 @@ class Brain:
                 result += 0.18 * min(1.0, proven_count / 10.0) * (proven_effect - 0.50)
             if count >= 3 and failure >= 0.65 and effect <= 0.06:
                 result -= 0.11 * min(1.0, count / 9.0) * failure
-            family_probability, family_trust = self.hierarchical_control_prediction(game, obs, i)
+            family_probability, family_trust = kinds_control[(family, action.kind)]
             result += 0.19 * family_trust * (family_probability - 0.5)
             result += 0.035 * self.inverse_intent_confidence(game, i)
-            result += self.transfer_intent_evidence(game, i)
+            intent = self.action_intents[i]
+            if intent not in intent_transfer:
+                intent_transfer[intent] = self.transfer_intent_evidence(game, i)
+            result += intent_transfer[intent]
             result += self.intent_value(game, state_key, i)
             if phase != 'policy' and count < 6 and self.experiment_relatives[i]:
                 neighboring = [game.action_applicability.get(state_key + ':' + str(j)) for j in self.experiment_relatives[i]]
@@ -6533,7 +7089,8 @@ class Brain:
                 result += 0.042 * min(1.0, comparisons / 2.0) / math.sqrt(1.0 + count)
             if family == 'pointer' and (obs.ui_text or obs.phase == 'menu'):
                 result += 0.07 * menu
-            scores.append(result + guidance[i] + self.contrastive_probe_bonus(game, obs, i, phase) + self.matched_experiment_bonus(game, obs, i, phase))
+            scores.append(result + guidance[i] + self.contrastive_probe_bonus(game, obs, i, phase)
+                          + self.matched_experiment_bonus(game, obs, i, phase, family_tests))
         return scores
 
     def hypothesis_information_bonus(self, game, obs, index):
@@ -6568,7 +7125,18 @@ class Brain:
                      for i, value in enumerate(estimates)]
         game.diagnostics['hierarchical_probe_updates'] += 1
         state_key = self.experiment_context(obs)
-        candidates = set(sorted(range(len(estimates)), key=estimates.__getitem__, reverse=True)[:84])
+        candidate_ranks = sorted(range(len(estimates)), key=estimates.__getitem__, reverse=True)
+        candidates = set(candidate_ranks[:28])
+        family_order = sorted(self.action_families,
+                              key=lambda family: max(estimates[i] for i in self.action_families[family])
+                              + 0.035 / math.sqrt(1.0 + family_attempts.get(family, 0)), reverse=True)
+        active_families = set(family_order[:2])
+        if game.game_steps % 5 == 0:
+            active_families.add(min(self.action_families,
+                                    key=lambda family: family_attempts.get(family, 0)))
+        for family in active_families:
+            candidates.update(sorted(self.action_families[family],
+                                     key=estimates.__getitem__, reverse=True)[:10])
         if phase == 'discovery':
             for representative in self.probe_representatives:
                 prior = game.action_applicability.get(state_key + ':' + str(representative))
@@ -6580,8 +7148,9 @@ class Brain:
         for family, indices in self.action_families.items():
             candidates.add(max(indices, key=estimates.__getitem__))
         for (family, kind), indices in self.action_kinds.items():
-            candidates.add(max(indices, key=estimates.__getitem__))
-            if phase == 'discovery' and kind in ('key', 'hold', 'click', 'focus_click', 'move', 'wheel', 'touch_tap', 'swipe'):
+            if family in active_families or phase == 'discovery' and game.game_steps % 7 == 0:
+                candidates.add(max(indices, key=estimates.__getitem__))
+            if phase == 'discovery' and family in active_families and kind in ('key', 'hold', 'click', 'focus_click', 'move', 'wheel', 'touch_tap', 'swipe'):
                 unexplored = [i for i in indices if game.action_effect_samples[i] < 2]
                 if unexplored:
                     representative = max(unexplored, key=lambda i: estimates[i]
@@ -6591,6 +7160,7 @@ class Brain:
                     game.diagnostics['active_experiment_families'] += 1
         top = max(estimates)
         winner, best = None, -1e20
+        joint_trials = []
         for index in candidates:
             alpha, beta = game.control_posteriors[index]
             global_draw = self.rng.betavariate(max(0.1, alpha), max(0.1, beta))
@@ -6654,9 +7224,25 @@ class Brain:
             if phase != 'policy':
                 family_count = family_attempts.get(family, 0)
                 utility += (0.085 if phase == 'discovery' else 0.045) / math.sqrt(1.0 + family_count / 3.0)
+            joint_trials.append((utility, index))
             if utility > best:
                 winner, best = index, utility
-        return winner if winner is not None else max(range(len(estimates)), key=estimates.__getitem__)
+        selected = winner if winner is not None else max(range(len(estimates)), key=estimates.__getitem__)
+        alternatives = sorted(joint_trials, reverse=True)
+        shortlist = [selected]
+        for _, candidate in alternatives:
+            if candidate not in shortlist and self.family_for_action[candidate] != self.family_for_action[selected]:
+                shortlist.append(candidate)
+                break
+        for _, candidate in alternatives:
+            if candidate not in shortlist:
+                shortlist.append(candidate)
+            if len(shortlist) >= 4:
+                break
+        self.experiment_joint_candidates = shortlist
+        self.experiment_joint_scores = {index: 0.050 - position * 0.017
+                                        for position, index in enumerate(shortlist)}
+        return selected
 
     def decision_diagnostics(self, obs, index, parameters=None, plan_length=1, predicted=False):
         game = self.game
@@ -6754,12 +7340,14 @@ class Brain:
         return [max(-1.0, min(1.0, float(features[index]))) for index in DUAL_VALUE_INDICES]
 
     def update_dual_values(self, game, observation, index, effect=None, control_confidence=0.0,
-                           objective=None, objective_confidence=0.0):
+                           objective=None, objective_confidence=0.0,
+                           information=None, information_confidence=0.0):
         values = self.dual_value_input(observation)
         norm = 1.0 + sum(value * value for value in values) / 8.0
         changed = False
         for kind, target, confidence in (('control', effect, control_confidence),
-                                         ('objective', objective, objective_confidence)):
+                                         ('objective', objective, objective_confidence),
+                                         ('information', information, information_confidence)):
             if target is None or not math.isfinite(float(target)) or confidence < 0.22:
                 continue
             matrix = getattr(game, kind + '_head')
@@ -6793,18 +7381,23 @@ class Brain:
             x = self.np.asarray(values, dtype=self.np.float32)
             control = self.np.tanh(game.control_head @ x + game.control_head_bias).tolist()
             objective = self.np.tanh(game.objective_head @ x + game.objective_head_bias).tolist()
+            information = self.np.tanh(game.information_head @ x + game.information_head_bias).tolist()
         else:
             control = [math.tanh(sum(a * b for a, b in zip(row, values)) + game.control_head_bias[i])
                        for i, row in enumerate(game.control_head)]
             objective = [math.tanh(sum(a * b for a, b in zip(row, values)) + game.objective_head_bias[i])
                          for i, row in enumerate(game.objective_head)]
+            information = [math.tanh(sum(a * b for a, b in zip(row, values)) + game.information_head_bias[i])
+                           for i, row in enumerate(game.information_head)]
         mature = min(1.0, (game.goal_value_samples + sum(game.objective_head_samples) / max(1, len(self.actions))) / 12.0)
         objective_weight = 0.08 + 0.30 * mature
         control_weight = 0.21 - 0.11 * mature
+        information_weight = 0.18 * (1.0 - 0.65 * mature)
         quality = getattr(observation, 'quality', {'confidence': 1.0})
         visual_confidence = max(0.15, min(1.0, float(quality.get('confidence', 1.0))))
         return [(control_weight * min(1.0, game.control_head_samples[i] / 7.0) * control[i]
-                 + objective_weight * min(1.0, game.objective_head_samples[i] / 5.0) * objective[i]) * visual_confidence
+                 + objective_weight * min(1.0, game.objective_head_samples[i] / 5.0) * objective[i]
+                 + information_weight * min(1.0, game.information_head_samples[i] / 6.0) * information[i]) * visual_confidence
                 for i in range(len(self.actions))]
 
     def intent_value(self, game, context, index):
@@ -6875,6 +7468,9 @@ class Brain:
             intent_context = self.experiment_context(obs)
             values = self._values(obs.features, game)
             values = values.tolist() if self.np is not None else values
+            kinds_control = {(family, kind): self.hierarchical_control_prediction(game, obs, indices[0])
+                             for (family, kind), indices in self.action_kinds.items()}
+            intent_transfer = {}
             if sum(game.task_q_samples) >= 5:
                 latent = self._encode(obs.features)
                 if self.np is not None:
@@ -6902,14 +7498,22 @@ class Brain:
                 visits = max(0, game.visits.get(obs.signature, 0))
                 contextual_bonus = math.log1p(visits + 2)
                 for i, action in enumerate(self.actions):
-                    local_record = self.applicability_record(game, obs, i)
+                    exact = game.action_applicability.get(state_key + ':' + str(i))
+                    contextual = game.action_applicability.get(intent_context + ':' + str(i))
+                    local_record = (contextual if exact is None else exact if contextual is None or exact[0] >= 3 else contextual)
                     attempts = int(local_record[0]) if local_record is not None else 0
                     failure = float(local_record[3]) if local_record is not None and attempts >= 2 else 0.0
                     exploration = 0.073 * math.sqrt(contextual_bonus / (1.0 + 2.2 * attempts + 0.25 * game.counts[i]))
                     exploration *= max(0.15, 1.0 - failure * min(1.0, attempts / 5.0) * 0.84)
                     exploration *= 0.55 + 0.45 * min(1.0, obs.novelty + game.stagnation / 35.0)
                     values[i] += exploration + 0.028 * math.log1p(action.prior)
-                    values[i] += 0.16 * (self.action_applicability(game, obs, i, state_key) - 1.0)
+                    if local_record is not None and attempts >= 2:
+                        count, effect, contextual_reward, failure_rate = local_record
+                        certainty = min(1.0, count / 9.0)
+                        desirability = max(-0.6, min(0.6, float(contextual_reward)))
+                        applicability = max(0.25, min(1.8,
+                            1.0 + certainty * (0.80 * effect + 1.20 * desirability - 0.85 * failure_rate)))
+                        values[i] += 0.16 * (applicability - 1.0)
                     alpha, beta = game.control_posteriors[i]
                     evidence = max(0.0, alpha + beta - 2.0)
                     if evidence > 0:
@@ -6923,12 +7527,15 @@ class Brain:
                     if game.action_goal_samples[i]:
                         certainty = min(1.0, game.action_goal_samples[i] / 7.0)
                         values[i] += 0.36 * certainty * game.action_goal[i]
-                    hierarchy_probability, hierarchy_trust = self.hierarchical_control_prediction(game, obs, i)
+                    hierarchy_probability, hierarchy_trust = kinds_control[(self.family_for_action[i], action.kind)]
                     values[i] += 0.11 * hierarchy_trust * (hierarchy_probability - 0.5)
                     values[i] += 0.025 * self.inverse_intent_confidence(game, i)
-                    values[i] += self.transfer_intent_evidence(game, i)
+                    intent = self.action_intents[i]
+                    if intent not in intent_transfer:
+                        intent_transfer[intent] = self.transfer_intent_evidence(game, i)
+                    values[i] += intent_transfer[intent]
                     values[i] += self.intent_value(game, intent_context, i)
-                    repeated = game.repeat_effects.get(self.experiment_context(obs) + ':' + action.id)
+                    repeated = game.repeat_effects.get(intent_context + ':' + action.id)
                     if repeated is not None and repeated[3] >= 3:
                         attempts = max(0.0, float(repeated[0]) + float(repeated[1]))
                         effectiveness = (float(repeated[0]) + 1.0) / (attempts + 2.0)
@@ -6965,47 +7572,78 @@ class Brain:
             game = self.game
             context = self.experiment_context(obs)
             selected = None
+            exploration = values is not None and len(candidates) <= 4 and len(set(values)) <= 5
+            evaluate_variants = self.vision_cost_ema < 0.40 and self.decision_cost_ema < 0.34
             for index in candidates:
                 action = self.actions[index]
-                parameters = self.recommend_action_parameters(index, obs, commit_focus=False)
-                x, y, duration, extent = parameters[:4]
-                score = float(values[index]) if values is not None else 0.0
-                prefix = context + ':' + action.id + ':'
+                proposed = tuple(self.recommend_action_parameters(index, obs, commit_focus=False))
                 spatial = action.kind in ('click', 'right', 'double', 'middle', 'focus_click',
                     'focus_right', 'focus_double', 'press', 'move', 'swipe', 'right_swipe',
                     'touch_tap', 'touch_swipe', 'pinch', 'dual_touch')
-                col = max(0, min(GW - 1, int(x * GW))) if spatial else -1
-                row = max(0, min(GH - 1, int(y * GH))) if spatial else -1
-                local = game.spatial_context_stats.get(prefix + f'{col}:{row}') if spatial else None
-                if local and local[0] >= 2:
-                    trust = min(0.88, local[0] / (local[0] + 7.0))
-                    score += trust * (0.23 * float(local[1]) + 0.12 * float(local[2]) - 0.17 * float(local[3]))
-                buckets = ((0.065, 0.12, 0.24, 0.48, 0.9, 1.45) if action.kind in ('key', 'hold', 'pair_hold', 'chord')
-                           else (0.12, 0.28, 0.55, 0.95, 1.4) if action.kind in ('press', 'swipe',
-                               'right_swipe', 'combat', 'move_fire', 'aim', 'look', 'touch_tap',
-                               'touch_swipe', 'pinch', 'dual_touch') else (action.duration,))
-                duration_bucket = min(buckets, key=lambda value: abs(value - duration))
-                extent_bucket = min((0.7, 1.0, 1.3), key=lambda value: abs(value - extent))
-                choice_key = prefix + f'{col}:{row}:{duration_bucket:.3f}:{extent_bucket:.1f}'
-                joint = game.joint_parameter_stats.get(choice_key)
-                if joint and joint[0] >= 2:
-                    trust = min(0.9, joint[0] / (joint[0] + 5.0))
-                    score += trust * (0.36 * float(joint[1]) + 0.18 * float(joint[2]) - 0.23 * float(joint[3]))
-                model = self.world_prediction(game, index, obs, self.parameter_dictionary(parameters, action, game.stagnation))
-                if model is not None:
-                    delta, expectation, confidence, uncertainty = model
-                    certainty = max(0.0, min(1.0, float(confidence)))
-                    if certainty >= 0.12:
-                        score += 0.16 * certainty * max(-0.8, min(0.8, float(expectation)))
-                        score -= 0.06 * certainty * max(0.0, min(1.0, float(uncertainty)))
-                        if game.goal_value_samples >= 3:
-                            future = self.apply_world_delta(obs.features, delta)
-                            progress = self.goal_value(game, self.goal_value_input(future)) - self.goal_value(game, self.goal_value_input(obs.features))
-                            score += 0.15 * certainty * max(-1.0, min(1.0, progress))
-                score -= 0.009 * max(0.0, duration - 0.20)
-                score += self.rng.random() * 0.003
-                if selected is None or score > selected[0]:
-                    selected = (score, index, parameters)
+                timed = action.kind in ('key', 'hold', 'pair_hold', 'chord', 'press', 'swipe',
+                    'right_swipe', 'combat', 'move_fire', 'aim', 'look', 'touch_tap',
+                    'touch_swipe', 'pinch', 'dual_touch')
+                variants = [proposed]
+                if evaluate_variants:
+                    if timed:
+                        for factor, extent in ((0.62, 0.85), (1.55, 1.15)):
+                            variants.append((proposed[0], proposed[1], max(0.04, min(2.3, proposed[2] * factor)),
+                                             max(0.5, min(1.5, proposed[3] * extent)), proposed[4]))
+                    if spatial:
+                        targets = sorted(obs.interaction_targets[:14],
+                            key=lambda item: float(item.get('confidence', 0.0)) *
+                                (0.4 + float(item.get('priority', 0.0))), reverse=True)
+                        for target in targets[:2]:
+                            if float(target.get('confidence', 0.0)) < 0.47:
+                                continue
+                            tx = max(0.01, min(0.99, float(target['x'])))
+                            ty = max(0.01, min(0.99, float(target['y'])))
+                            if math.hypot(tx - proposed[0], ty - proposed[1]) >= 0.045:
+                                variants.append((tx, ty, proposed[2], proposed[3], proposed[4]))
+                unique = OrderedDict()
+                for parameter in variants:
+                    coordinate = (round(parameter[0], 3), round(parameter[1], 3),
+                                  round(parameter[2], 3), round(parameter[3], 2))
+                    unique.setdefault(coordinate, parameter)
+                for parameters in list(unique.values())[:5]:
+                    x, y, duration, extent = parameters[:4]
+                    score = float(values[index]) if values is not None else 0.0
+                    prefix = context + ':' + action.id + ':'
+                    col = max(0, min(GW - 1, int(x * GW))) if spatial else -1
+                    row = max(0, min(GH - 1, int(y * GH))) if spatial else -1
+                    local = game.spatial_context_stats.get(prefix + f'{col}:{row}') if spatial else None
+                    if local and local[0] >= 2:
+                        trust = min(0.88, local[0] / (local[0] + 7.0))
+                        score += trust * (0.23 * float(local[1]) + 0.12 * float(local[2]) - 0.17 * float(local[3]))
+                    buckets = ((0.065, 0.12, 0.24, 0.48, 0.9, 1.45) if action.kind in ('key', 'hold', 'pair_hold', 'chord')
+                               else (0.12, 0.28, 0.55, 0.95, 1.4) if timed else (action.duration,))
+                    duration_bucket = min(buckets, key=lambda value: abs(value - duration))
+                    extent_bucket = min((0.7, 1.0, 1.3), key=lambda value: abs(value - extent))
+                    choice_key = prefix + f'{col}:{row}:{duration_bucket:.3f}:{extent_bucket:.1f}'
+                    joint = game.joint_parameter_stats.get(choice_key)
+                    if joint and joint[0] >= 2:
+                        trust = min(0.9, joint[0] / (joint[0] + 5.0))
+                        score += trust * (0.36 * float(joint[1]) + 0.18 * float(joint[2]) - 0.23 * float(joint[3]))
+                    elif exploration and evaluate_variants:
+                        score += 0.014 / math.sqrt(1.0 + game.action_attempts[index] * 0.2)
+                    model = self.world_prediction(game, index, obs, self.parameter_dictionary(parameters, action, game.stagnation))
+                    if model is not None:
+                        delta, expectation, confidence, uncertainty = model
+                        certainty = max(0.0, min(1.0, float(confidence)))
+                        if certainty >= 0.12:
+                            score += 0.16 * certainty * max(-0.8, min(0.8, float(expectation)))
+                            score -= 0.06 * certainty * max(0.0, min(1.0, float(uncertainty)))
+                            if game.goal_value_samples >= 3:
+                                future = self.apply_world_delta(obs.features, delta)
+                                progress = (self.goal_value(game, self.goal_value_input(future))
+                                            - self.goal_value(game, self.goal_value_input(obs.features)))
+                                score += 0.15 * certainty * max(-1.0, min(1.0, progress))
+                    score -= 0.009 * max(0.0, duration - 0.20)
+                    score -= 0.003 * abs(math.log(max(0.04, duration) / max(0.04, proposed[2])))
+                    score += self.rng.random() * 0.003
+                    game.diagnostics['parameter_trials'] += 1
+                    if selected is None or score > selected[0]:
+                        selected = (score, index, parameters)
             _, choice, params = selected
             self.choice_parameters = (getattr(obs, 'frame_uid', None), int(choice), tuple(params))
             if self.actions[choice].kind in ('click', 'right', 'double', 'middle', 'focus_click',
@@ -7036,7 +7674,12 @@ class Brain:
             movement_evidence = max(min(1.0, sum(float(item.get('activity', 0.0)) for item in obs.objects[:12]) / 4.0),
                                     0.65 * obs.phase_confidence if obs.phase == 'playing' else 0.0)
             if exploration_phase != 'policy' and self.rng.random() < (0.63 if exploration_phase == 'discovery' else 0.28):
-                return self.choose_joint(obs, [self.select_experiment(game, obs, exploration_phase, family_attempts)])
+                experiment = self.select_experiment(game, obs, exploration_phase, family_attempts)
+                options = getattr(self, 'experiment_joint_candidates', [experiment])
+                priorities = [0.0] * len(self.actions)
+                for option in options:
+                    priorities[option] = self.experiment_joint_scores.get(option, 0.0)
+                return self.choose_joint(obs, options, priorities)
             if self.rng.random() < epsilon:
                 families = list(self.action_families)
                 family_weights = []
@@ -7534,10 +8177,16 @@ class Brain:
                     goal_successes = max(0, int(info.get('objective_successes', 0)))
                     navigation_successes = max(0, int(info.get('navigation_successes', 0)))
                     if source is not game:
-                        if (attempts < 10 or lower_success < 0.47 or float(info.get('causal_reliability', 0.0)) < 0.24
-                                or navigation_successes < 4 or goal_successes < 2
-                                or not isinstance(semantic_context, list) or len(semantic_context) != 16):
+                        navigation = info.get('purpose') == 'navigation'
+                        if (not isinstance(semantic_context, list) or len(semantic_context) != 16
+                                or (navigation and (attempts < 12 or lower_success < 0.50
+                                    or float(info.get('causal_reliability', 0.0)) < 0.36
+                                    or navigation_successes < 6))
+                                or (not navigation and (attempts < 10 or lower_success < 0.47
+                                    or float(info.get('causal_reliability', 0.0)) < 0.24
+                                    or navigation_successes < 4 or goal_successes < 2))):
                             continue
+                        game.diagnostics['skill_transfer_context_checks'] += 1
                     object_gap = self.skill_object_gap(info.get('object_context'), self.skill_object_summary(obs))
                     if object_gap > (0.34 if source is game else 0.23):
                         continue
@@ -7587,8 +8236,10 @@ class Brain:
                                 target_support.append((known[0] - 1.0) / n)
                         baseline = sum(target_support) / len(target_support) if target_support else 0.45
                         if target_support and baseline < 0.30:
-                            score *= max(0.45, 0.65 + 0.70 * baseline)
                             game.diagnostics['transfer_target_control_conflicts'] += 1
+                            if len(target_support) >= 2 and max(target_support) < 0.20:
+                                continue
+                            score *= max(0.45, 0.65 + 0.70 * baseline)
                         relative_value = max(0.30, min(1.25, 0.72 + 0.85 *
                                                 (lower_trust - max(0.25, baseline * 0.45))))
                         score *= max(0.06, min(1.15, trust * 1.65 * relative_value /
@@ -7807,13 +8458,30 @@ class Brain:
                   max(0.025, min(1.5, duration)), max(0.5, min(1.5, extent)), certainty, 'world_plan')
         return self.compose_action_parameters(obs, action, params) if action.kind == 'compose' else params
 
-    def compose_action_parameters(self, observation, action, parameters):
+    def compose_action_parameters(self, observation, action, parameters, expand=False):
         if action.kind != 'compose':
             return parameters
         if len(parameters) >= 9:
             try:
                 a, b = int(parameters[6]), int(parameters[7])
                 if 8 <= a <= 254 and not stop_equivalent(a, self.stop_vk) and (b == 0 or 8 <= b <= 254 and b != a and not stop_equivalent(b, self.stop_vk)):
+                    if not expand or len(parameters) > 9 or self.rng.random() >= 0.38:
+                        return tuple(parameters)
+                    ranked = []
+                    for candidate in self.actions:
+                        if candidate.kind != 'key' or candidate.a in (a, b) or stop_equivalent(candidate.a, self.stop_vk):
+                            continue
+                        index = self.action_index[candidate.id]
+                        alpha, beta = self.game.control_posteriors[index]
+                        observed = max(0.0, float(alpha + beta) - 2.0)
+                        if observed >= 5 and alpha > beta * 1.30:
+                            ranked.append((float(alpha) / max(2.0, float(alpha + beta))
+                                           + max(0.0, self.game.action_effect[index]) * 0.16
+                                           - self.game.action_attempts[index] * 0.0001, candidate.a))
+                    if ranked:
+                        ranked.sort(reverse=True)
+                        candidate = self.rng.choice(ranked[:min(5, len(ranked))])[1]
+                        return tuple(parameters) + (candidate,)
                     return tuple(parameters)
             except (TypeError, ValueError, OverflowError):
                 pass
@@ -7876,7 +8544,9 @@ class Brain:
         result = {'start_x': x, 'start_y': y, 'requested_duration': float(parameters[2]),
                   'duration': float(parameters[2]), 'extent': float(parameters[3]), 'spatial': spatial}
         if kind == 'compose' and len(parameters) >= 9:
-            result.update({'a': int(parameters[6]), 'b': int(parameters[7]), 'composed_mouse': bool(parameters[8])})
+            result.update({'a': int(parameters[6]), 'b': int(parameters[7]),
+                           'c': int(parameters[9]) if len(parameters) >= 10 else 0,
+                           'composed_mouse': bool(parameters[8])})
         return result
 
     def plan_with_world_model(self, obs):
@@ -7885,14 +8555,20 @@ class Brain:
         root_q = self._values(obs.features, game)
         root_q = root_q.tolist() if self.np is not None else root_q
         root_dual = self.dual_value_scores(game, obs.features)
-        if not (game.world or game.world_network_steps >= 28):
+        if not (game.world or game.world_network_steps >= 28) or sum(game.world_validation_samples) < 4:
             return [self.choose(obs)], []
         precision = game.prediction_error_mean + 1.5 * math.sqrt(max(0.0, game.prediction_error_variance))
-        horizon = (5 if self.np is not None and game.prediction_error_samples >= 60 and precision < 0.045
+        horizon = (6 if self.np is not None and game.prediction_error_samples >= 90 and precision < 0.035
+                   else 5 if self.np is not None and game.prediction_error_samples >= 60 and precision < 0.045
                    else 4 if self.np is not None and game.prediction_error_samples >= 20 and precision < 0.065
                    else 3 if game.prediction_error_samples >= 10 and precision < 0.10 else 2)
         if game.prediction_error_samples < 6 or precision > 0.16:
             horizon = 2
+        planned = max(1, int(game.diagnostics['validated_world_plans']))
+        failed_plans = max(0, int(game.diagnostics['plan_action_mismatches']))
+        if failed_plans >= 3 and failed_plans / (planned + failed_plans) >= 0.22:
+            horizon = min(horizon, 2)
+            game.diagnostics['online_replan_horizon_reductions'] += 1
         scene_validation = game.world_holdout_groups.get(self.world_holdout_group(obs))
         if scene_validation is not None and scene_validation[0] >= 4:
             if scene_validation[1] > 0.15:
@@ -7900,6 +8576,8 @@ class Brain:
                 game.diagnostics['scene_uncertain_horizon_reductions'] += 1
             elif scene_validation[1] > 0.085:
                 horizon = min(horizon, 3)
+        elif scene_validation is None or scene_validation[0] < 2:
+            horizon = min(horizon, 2)
         if len(game.world_holdout_groups) < 3:
             horizon = min(horizon, 2)
         elif len(game.world_holdout_groups) < 7:
@@ -7920,6 +8598,20 @@ class Brain:
             horizon = min(horizon, 3)
         elif heldout_count < 90 or heldout_good > 0.055:
             horizon = min(horizon, 4)
+        current_subgoals = self.scene_subgoal_reachability(game, obs.signature)
+        grounded_root_actions = {}
+        if len(obs.signature) == 16 and current_subgoals:
+            for edge, record in game.scene_graph.items():
+                if (edge.startswith(obs.signature + ':') and len(edge) == 33
+                        and isinstance(record, list) and len(record) >= 5 and record[0] >= 4
+                        and float(record[2]) >= 0.45):
+                    successor = edge[17:]
+                    if successor not in current_subgoals:
+                        continue
+                    action_index = max(0, min(len(self.actions) - 1, round(float(record[1]) * len(self.actions))))
+                    grounded_root_actions[action_index] = max(grounded_root_actions.get(action_index, 0.0),
+                        current_subgoals[successor] * min(1.0, float(record[0]) / 12.0)
+                        * float(record[2]) * (0.35 + 0.65 * float(record[3])))
         beam = [(0.0, [], obs.features[:], [], 1.0, [], 0.0)]
         completed = []
         for depth in range(horizon):
@@ -7929,7 +8621,7 @@ class Brain:
                           self.predicted_state_scores(game, features, estimates, root_q, root_dual, obs))
                 ranks = sorted(range(len(values)),
                                key=lambda i: values[i] + 0.16 * game.action_effect[i]
-                               - (0.09 if path and path[-1] == i else 0.0), reverse=True)[:(38 if not path else 22)]
+                               - (0.09 if path and path[-1] == i else 0.0), reverse=True)[:(22 if not path else 12)]
                 for family, indices in self.action_families.items():
                     peak = max(indices, key=lambda i: values[i] + 0.10 * game.action_effect[i])
                     if peak not in ranks:
@@ -7961,6 +8653,10 @@ class Brain:
                     risk = (0.16 * uncertainty + 0.04 * max(0.0, 0.5 - confidence)
                             + (0.08 * min(1.0, error_mean + error_spread) if error_count >= 3 else 0.0)
                             + 0.012 * (depth + 1) * max(0.0, min(1.0, float(getattr(obs, 'state_uncertainty', 0.5)))))
+                    if failed_plans >= 3:
+                        risk += 0.05 * min(1.0, failed_plans / (planned + failed_plans)) * (1.0 + 0.20 * depth)
+                    if scene_validation is None or scene_validation[0] < 2:
+                        risk += 0.03 * (depth + 1) * max(0.25, uncertainty)
                     learned_goal = min(1.0, game.goal_value_samples / 7.0)
                     predicted_goal_change = (self.goal_value(game, self.goal_value_input(changed))
                                              - self.goal_value(game, self.goal_value_input(features)))
@@ -7972,9 +8668,11 @@ class Brain:
                     elapsed_to_step = elapsed
                     score = utility + temporal_discount(elapsed_to_step) * (max(-0.3, min(0.3, values[index])) * 0.40
                               + max(-0.3, min(0.75, expected_reward)) * 0.14
+                              * min(1.0, game.action_goal_samples[index] / 5.0)
                               + 0.21 * learned_goal * max(-0.4, min(0.4, predicted_goal_change))
                               + 0.16 * goal_support + 0.12 * event_outcome * event_confidence
                               + 0.035 * event_information * event_information_confidence
+                              + (0.065 * grounded_root_actions.get(index, 0.0) * confidence if not path else 0.0)
                               + confidence * 0.055 - repetition - risk
                               - 0.022 * (depth + 1) * uncertainty - 0.025 * estimated_duration)
                     path2 = path + [index]
@@ -7987,8 +8685,33 @@ class Brain:
             if not advanced:
                 break
             advanced.sort(key=lambda item: item[0] + 0.11 * item[4], reverse=True)
-            beam_width = 3 if self.vision_cost_ema > 0.35 and self.np is None else 4
-            beam = advanced[:beam_width]
+            beam_width = 2 if self.decision_cost_ema > 0.45 else 3 if self.vision_cost_ema > 0.35 and self.np is None else 4
+            beam = []
+            root_counts = {}
+            kept_paths = set()
+            for proposal in advanced:
+                root = proposal[1][0]
+                if root_counts.get(root, 0) >= 2:
+                    continue
+                key = tuple(proposal[1])
+                if key in kept_paths:
+                    continue
+                beam.append(proposal)
+                kept_paths.add(key)
+                root_counts[root] = root_counts.get(root, 0) + 1
+                if len(beam) >= beam_width:
+                    break
+            if len(beam) < beam_width:
+                for proposal in advanced:
+                    key = tuple(proposal[1])
+                    if key in kept_paths:
+                        continue
+                    beam.append(proposal)
+                    kept_paths.add(key)
+                    if len(beam) >= beam_width:
+                        break
+            if len(root_counts) >= 2:
+                game.diagnostics['plan_root_diversity'] += 1
             completed.extend(beam)
         completed = [row for row in completed if len(row[1]) >= 2 and row[4] >= (0.028 if precision < 0.09 else 0.055)]
         if not completed:
@@ -8215,11 +8938,27 @@ class Brain:
             if (key, direction) not in recent or strength > recent[(key, direction)][0]:
                 recent[(key, direction)] = (strength, signal_type)
         positive, negative = 0.0, 0.0
+        family_support = {}
         detected = []
+        contextual_contradiction = 0.0
         cross_modal = len({source[1] for source in recent.values()}) >= 2
         for (key, direction), (strength, signal_type) in recent.items():
             hypothesis = game.goal_hypotheses.get(key)
             support, confidence = self.goal_hypothesis_score(hypothesis, direction)
+            if hypothesis is not None and len(hypothesis) == 4:
+                up_positive, up_negative, down_positive, down_negative = [max(0.0, float(value)) for value in hypothesis]
+                aligned_positive, aligned_negative = ((up_positive, up_negative)
+                    if direction > 0 else (down_positive, down_negative))
+                total_outcomes = aligned_positive + aligned_negative
+                if total_outcomes >= 1.0:
+                    backed_positive = max(0.0, aligned_positive - 1.0)
+                    backed_negative = max(0.0, aligned_negative - 1.0)
+                    backed_total = backed_positive + backed_negative
+                    contradiction = 2.0 * min(backed_positive, backed_negative) / max(0.001, backed_total)
+                    contextual_contradiction = max(contextual_contradiction, contradiction)
+                    confidence *= max(0.12, 1.0 - 0.82 * contradiction)
+                    if contradiction >= 0.50:
+                        game.diagnostics['rejected_proxy_goals'] += 1
             if signal_type in ('relation', 'phase') and not cross_modal:
                 confidence *= 0.54
                 if hypothesis is not None and signal_type == 'relation':
@@ -8228,17 +8967,29 @@ class Brain:
             if calibration is not None:
                 independent = (int(calibration[0]) | int(calibration[1])).bit_count()
                 support_conflict = min(int(calibration[0]).bit_count(), int(calibration[1]).bit_count())
+                favorable_contexts = int(calibration[0]).bit_count()
+                adverse_contexts = int(calibration[1]).bit_count()
                 confidence *= (0.22 + 0.78 * min(1.0, independent / 3.0))
                 if independent < 2:
                     confidence *= 0.50
+                if favorable_contexts and adverse_contexts:
+                    disagreement = 2.0 * min(favorable_contexts, adverse_contexts) / max(1, favorable_contexts + adverse_contexts)
+                    contextual_contradiction = max(contextual_contradiction, disagreement)
+                    confidence *= max(0.12, 1.0 - 0.72 * disagreement)
                 confidence *= max(0.30, 1.0 - 0.16 * support_conflict)
             if confidence >= 0.12:
                 contribution = min(0.085, 0.13 * strength * confidence * reliability * abs(support))
+                family_key = (signal_type, support < 0)
+                limit = {'hud': 0.052, 'number': 0.065, 'meter': 0.065,
+                         'relation': 0.035, 'phase': 0.028}.get(signal_type, 0.035)
+                contribution = min(contribution, max(0.0, limit - family_support.get(family_key, 0.0)))
+                family_support[family_key] = family_support.get(family_key, 0.0) + contribution
                 if support >= 0:
                     positive += contribution
                 else:
                     negative += contribution
-            if confirmed is None and reliability >= 0.30 and strength >= 0.06:
+            if (confirmed is None and reliability >= 0.30 and strength >= 0.06
+                    and not (old.phase == 'menu' and new.phase == 'menu')):
                 if not game.numeric_recent or game.numeric_recent[-1] != (key, direction, self.step):
                     game.numeric_recent.append((key, direction, self.step))
         if confirmed in ('win', 'task', 'loss'):
@@ -8293,8 +9044,8 @@ class Brain:
             game.hud_trends.popitem(last=False)
         total = positive + negative
         conflict = (2.0 * min(positive, negative) / total) if total >= 0.002 else 0.0
-        game.goal_signal_conflict = max(0.0, min(1.0, conflict))
-        signal = (positive - negative) * (1.0 - 0.65 * game.goal_signal_conflict)
+        game.goal_signal_conflict = max(0.0, min(1.0, max(conflict, contextual_contradiction)))
+        signal = (positive - negative) * (1.0 - 0.82 * game.goal_signal_conflict)
         return max(-0.18, min(0.18, signal)), detected[:12]
 
     def discover_goal_candidates(self, game, old, new, semantic, causal, persistence, stability, seen):
@@ -8684,6 +9435,10 @@ class Brain:
                 passive = max(passive * 0.65, scene_mean + 1.65 * natural_variance)
             else:
                 passive = max(passive, game.baseline_change * 0.18)
+            pre_action_drift = (float(effect.get('pre_action_visual_change') or 0.0)
+                                if isinstance(effect, dict) else 0.0)
+            if math.isfinite(pre_action_drift) and pre_action_drift > 0.0:
+                passive = max(passive, min(0.50, pre_action_drift) * 0.72)
             elapsed_for_feedback = action_elapsed_seconds(effect)
             timed_context = 'context:' + self.experiment_context(old)
             duration_band = 'short' if elapsed_for_feedback < 0.12 else 'medium' if elapsed_for_feedback < 0.42 else 'long'
@@ -8741,13 +9496,34 @@ class Brain:
             causal *= max(0.45, motion_factor)
             if len(samples) >= 2 and post_drift > peak * 0.65:
                 causal *= max(0.15, 1.0 - min(1.0, post_drift / max(0.015, peak)) * 0.55)
+            temporal_trust = temporal_response_confidence(samples, interval_deltas, passive, signals.get('frame_stability', 0.0))
+            causal *= 0.55 + 0.45 * temporal_trust
+            intervention_evidence = action_response_evidence(
+                samples, passive, pre_action_drift, post_drift,
+                float(signals.get('frame_stability', 0.0)), signals.get('frame_times'))
+            if len(samples) >= 2:
+                causal *= 0.77 + 0.23 * intervention_evidence
+            local_peak = max(0.0, float(signals.get('regional_peak_change') or 0.0))
+            focused_peak = max(0.0, float(signals.get('focused_change') or 0.0))
+            if len(samples) >= 2 and signals.get('frame_stability', 0.0) >= 0.45:
+                focused_baseline = max(0.12, passive * 2.2)
+                if focused_peak >= focused_baseline and local_peak >= 0.075:
+                    local_causal = max(0.0, min(0.60, (focused_peak - focused_baseline * 0.65)
+                                     / max(0.15, focused_peak)))
+                    causal = max(causal, local_causal * temporal_trust * 0.65)
+            if signals.get('response_onset_left_censored') and game.passive_samples < 2:
+                causal *= 0.85
             game.baseline_change = game.baseline_change * 0.975 + delta * 0.025
             control_trace_valid = bool(isinstance(effect, dict) and effect.get('input_sent')
                                        and effect.get('feedback_valid', True) and len(samples) >= 2
+                                       and (not 'post_action_frame_verified' in signals or signals['post_action_frame_verified'])
                                        and float(signals.get('frame_stability', 0.0)) >= 0.42)
             controllability = self.infer_controllability(old, new, idx, causal if control_trace_valid else 0.0,
                                                         camera_shift, camera_confidence)
             differences = [b - a for a, b in zip(self.world_state(old), self.world_state(new))]
+            if (control_trace_valid and game.world_network_steps < 48 and game.game_steps <= 160
+                    and old.quality.get('trainable', False) and new.quality.get('trainable', False)):
+                self.transfer_probes.append((list(old.features), idx, dict(effect), differences[:]))
             world_keys = [idx, self._world_key(idx, old)]
             if effect is not None and effect.get('input_sent'):
                 world_keys.append(self._world_key(idx, old, effect))
@@ -8776,6 +9552,12 @@ class Brain:
             effect_probability, effect_confidence, effect_uncertainty = self.effect_prediction(game, old, idx, effect)
             if control_trace_valid and effect_observation in (0.0, 1.0):
                 self.record_paired_probe(game, old, idx, effect_observation, effect_sample_confidence)
+            screen_response_correlated = bool(control_trace_valid and effect_observation == 1.0
+                                              and effect_sample_confidence >= 0.32
+                                              and intervention_evidence >= 0.22
+                                              and causal >= 0.16)
+            if screen_response_correlated:
+                game.diagnostics['screen_correlated_control_responses'] += 1
             if effect_observation == 1.0:
                 game.diagnostics['effective_controls'] += 1
                 if game.diagnostics['first_effect_action'] == 0:
@@ -8989,9 +9771,12 @@ class Brain:
                                 / math.sqrt(1.0 + max(0, seen)))
             intrinsic_reward = intrinsic_reward * exploration_weight + relational_information + unverified_bonus
             calibrated_goals = self.calibrated_goal_count(game)
+            evidence_tiers = self.evidence_layers(semantic_evidence, causal, persistence, stable_scene,
+                                                  calibrated_goals, game.goal_value_samples, confirmed_result)
             credible_progress = bool(confirmed_result in ('win', 'task') or
-                calibrated_goals >= 1 and task_signal > 0.009 and causal >= 0.35
-                and persistence >= 0.45 and stable_scene >= 0.50 and game.goal_signal_conflict < 0.30)
+                calibrated_goals >= 1 and evidence_tiers['corroborated'] and task_signal > 0.009
+                and causal >= 0.35 and persistence >= 0.45 and stable_scene >= 0.50
+                and game.goal_signal_conflict < 0.30)
             if credible_progress:
                 game.goal_no_progress_streak = 0
             elif confirmed_result == 'loss':
@@ -9008,8 +9793,6 @@ class Brain:
                 intrinsic_reward *= scale
                 game.diagnostics['visual_stall_penalties'] += 1
 
-            evidence_tiers = self.evidence_layers(semantic_evidence, causal, persistence, stable_scene,
-                                                  calibrated_goals, game.goal_value_samples, confirmed_result)
             if evidence_tiers['corroborated']:
                 game.diagnostics['corroborated_progress'] += 1
             outcome_score = explicit_proxy
@@ -9019,7 +9802,8 @@ class Brain:
             if confirmed_result is None and goal_signal_conflict > 0.0:
                 progress_score *= max(0.10, 1.0 - 0.75 * goal_signal_conflict)
             if confirmed_result is None and not evidence_tiers['corroborated']:
-                progress_score *= max(0.22, 0.35 + 0.65 * evidence_tiers['calibration'])
+                progress_score *= max(0.12, 0.24 + 0.52 * evidence_tiers['calibration'])
+                progress_score = max(-0.025, min(0.025, progress_score))
             objective_proxy = progress_score + outcome_score
             if confirmed_result in ('win', 'task'):
                 game.diagnostics['credible_goal_progress'] += 1
@@ -9033,14 +9817,28 @@ class Brain:
                                              + 0.20 * min(1.0, calibrated_goals / 12.0)))
             objective_proxy *= goal_reliability
             if confirmed_result is None:
-                objective_proxy *= max(0.16, min(1.0, 0.16 + 0.84 * evidence_tiers['progress']
+                objective_proxy *= max(0.08, min(1.0, 0.08 + 0.92 * evidence_tiers['progress']
                                                 * (0.20 + 0.80 * evidence_tiers['calibration'])))
+                if not evidence_tiers['corroborated']:
+                    objective_proxy = max(-0.010, min(0.010, objective_proxy))
             if learned_goals >= 0.6 or confirmed_result:
                 intrinsic_reward = min(intrinsic_reward, max(0.0015, 0.020 * (1.0 - learned_goals) + 0.006))
             control_reward = 0.003 * causal * persistence if world_trustworthy and game.stagnation < 24 else 0.0
             proxy_exploration = min(0.008, 0.004 * meaningful_event + 0.003 * progress_landmark)
             if confirmed_result is None and not calibrated_goals:
                 proxy_exploration *= 0.45
+            uncorroborated_visual_activity = bool(confirmed_result is None and not credible_progress
+                                                 and peak > 0.045 and causal < 0.24)
+            if uncorroborated_visual_activity:
+                intrinsic_reward *= 0.42
+                proxy_exploration *= 0.28
+            camera_only_activity = bool(confirmed_result is None and not credible_progress
+                                        and camera_confidence >= 0.60 and local_ratio <= 0.22
+                                        and not evidence_tiers['corroborated'] and loop_count >= 2)
+            if camera_only_activity:
+                intrinsic_reward *= max(0.07, 0.40 / (1.0 + loop_count * 0.17))
+                proxy_exploration *= 0.18
+                game.diagnostics['camera_only_exploration_penalties'] += 1
             recurring_without_progress = (loop_count >= 3 and causal < 0.30 and confirmed_result is None
                                            and max(0.0, task_signal) < 0.008 and meaningful_event < 0.03)
             if recurring_without_progress:
@@ -9204,6 +10002,10 @@ class Brain:
                 'proxy_reward': round(reward, 5),
                 'objective_training_signal': round(objective_training_signal, 6),
                 'information_training_signal': round(information_training_signal, 6),
+                'control_training_signal': round((1.0 if effect_observation == 1.0 else -1.0
+                                                  if effect_observation == 0.0 else 0.0)
+                                                 * effect_sample_confidence * quality, 6),
+                'exploration_training_signal': round((intrinsic_reward + proxy_exploration) * quality, 6),
                 'objective_evidence_tier': 'screen_correlated_result' if confirmed_result else
                     'calibrated_proxy' if calibrated_goals >= 1 and evidence_tiers['corroborated'] else 'unverified',
                 'action_evidence_confidence': round(action_evidence_confidence, 4),
@@ -9226,15 +10028,27 @@ class Brain:
                 'peak_action_visual_change': round(peak, 5),
                 'estimated_action_effect': round(effective, 5),
                 'causal_confidence': round(causal, 4),
+                'intervention_vs_passive_confidence': round(intervention_evidence, 5),
+                'screen_response_correlated_with_action': screen_response_correlated,
+                'screen_response_is_not_input_receipt_proof': True,
                 'control_signal': round(quality * causal * persistence, 5),
+                'control_effect': effect_observation,
                 'control_effect_confidence': round(action_evidence_confidence, 5),
+                'goal_progress': round(progress_score * quality, 5),
+                'goal_progress_verified': False,
+                'goal_progress_screen_correlated': bool(goal_evidence_trainable and objective_evidence_confidence >= 0.25),
                 'progress_signal': round(progress_score * quality, 5),
                 'progress_confidence': round(objective_evidence_confidence if calibrated_goals else 0.0, 5),
                 'outcome_signal': round(outcome_score * quality, 5),
                 'outcome_confidence': round(result_confidence if confirmed_result else 0.0, 5),
+                'outcome_state': confirmed_result if confirmed_result else 'unknown',
                 'regional_causal_fraction': round(region_causal_fraction, 5) if region_causal_fraction is not None else None,
-                'input_accepted_by_os': bool(isinstance(effect, dict) and effect.get('input_sent')),
+                'regional_peak_visual_response': round(local_peak, 5),
+                'focused_visual_response': round(focused_peak, 5),
+                'input_dispatch_confirmed_by_os': bool(isinstance(effect, dict) and effect.get('windows_input_dispatch_confirmed')),
+                'input_accepted_by_os': bool(isinstance(effect, dict) and effect.get('windows_input_dispatch_confirmed')),
                 'game_input_received_verified': None,
+                'game_input_receipt_proven': False,
                 'control_learning_verified': world_trustworthy,
                 'passive_world_feedback_verified': passive_trustworthy,
                 'passive_world_holdout': passive_holdout,
@@ -9264,6 +10078,9 @@ class Brain:
                 'goal_progress_candidate': round(goal_candidate, 5),
                 'recurring_without_confirmed_progress': recurring_without_progress,
                 'visual_activity_without_goal_progress': bool(visual_stall),
+                'uncorroborated_visual_activity': uncorroborated_visual_activity,
+                'camera_only_exploration_suppressed': camera_only_activity,
+                'independent_progress_evidence': bool(evidence_tiers['corroborated']),
                 'goal_no_progress_streak': game.goal_no_progress_streak,
                 'credible_proxy_progress': credible_progress,
                 'objective_evidence': semantic_evidence,
@@ -9475,11 +10292,14 @@ class Brain:
             target_encoder_bias = convert(self.target_encoder_bias)
             converted = {}
             for key, game in self.games.items():
-                converted[key] = (convert(game.q), convert(game.bias), convert(game.target_q), convert(game.target_bias),
-                                  convert(game.control_head), convert(game.objective_head),
-                                  convert(game.control_head_bias), convert(game.objective_head_bias),
-                                  {kind: (convert(head['w']), convert(head['b']), head['samples']) for kind, head in game.parameter_heads.items()},
-                                  {name: convert(value) for name, value in game.world_network.items()} if game.world_network is not None else None)
+                fields = ('q', 'bias', 'target_q', 'target_bias', 'task_q', 'task_bias',
+                          'target_task_q', 'target_task_bias', 'control_head', 'objective_head',
+                          'information_head', 'control_head_bias', 'objective_head_bias', 'information_head_bias')
+                converted[key] = ({field: convert(getattr(game, field)) for field in fields},
+                                  {kind: (convert(head['w']), convert(head['b']), head['samples'])
+                                   for kind, head in game.parameter_heads.items()},
+                                  {name: convert(value) for name, value in game.world_network.items()}
+                                  if game.world_network is not None else None)
             self.np = target
             try:
                 self.cv_np = importlib.import_module('numpy') if target is None else target
@@ -9491,10 +10311,11 @@ class Brain:
             for key, values in converted.items():
                 game = self.games[key]
                 game.np = target
-                game.q, game.bias, game.target_q, game.target_bias = values[:4]
-                game.control_head, game.objective_head, game.control_head_bias, game.objective_head_bias = values[4:8]
-                game.parameter_heads = {kind: {'w': w, 'b': b, 'samples': samples} for kind, (w, b, samples) in values[8].items()}
-                game.world_network = values[9]
+                for name, converted_value in values[0].items():
+                    setattr(game, name, converted_value)
+                game.parameter_heads = {kind: {'w': w, 'b': b, 'samples': samples}
+                                        for kind, (w, b, samples) in values[1].items()}
+                game.world_network = values[2]
             self.backend_generation += 1
             self.backend_recoveries += 1
             self.dirty_games.update(self.games)
@@ -10587,7 +11408,14 @@ class Brain:
                 self.update_dual_values(game, old, index, effect=control_target,
                                         control_confidence=float(self.reward_info.get('action_effect_observation_confidence') or 0.0),
                                         objective=goal_target,
-                                        objective_confidence=float(self.reward_info.get('objective_evidence_confidence') or 0.0))
+                                        objective_confidence=float(self.reward_info.get('objective_evidence_confidence') or 0.0),
+                                        information=max(-1.0, min(1.0,
+                                            24.0 * float(self.reward_info.get('exploration_training_signal') or 0.0)
+                                            + 0.18 * float(self.reward_info.get('action_effect_information_gain') or 0.0)
+                                            - 0.40 * float(bool(self.reward_info.get('recurring_without_confirmed_progress')))
+                                            - 0.32 * float(bool(self.reward_info.get('camera_only_exploration_suppressed'))))),
+                                        information_confidence=(confidence * 0.78 if
+                                            self.reward_info.get('feedback_samples', 0) >= 2 else 0.0))
                 self.update_intent_values(game, old, index, effect=control_target,
                                           effect_confidence=float(self.reward_info.get('action_effect_observation_confidence') or 0.0),
                                           objective=goal_target if goal_known else None,
@@ -11008,6 +11836,38 @@ class Brain:
                                     owner.diagnostics['replay_counterexamples'] += 1
                     if accepted >= quota:
                         break
+        if replay_count >= 4 and len(self.memory) >= 12 and samples:
+            episodes = {}
+            for transition in list(self.memory)[-2400:]:
+                detail = transition[9] if len(transition) > 9 and isinstance(transition[9], dict) else {}
+                episode = detail.get('learning_episode_id')
+                step = detail.get('learning_step')
+                if (isinstance(episode, str) and len(episode) >= 8 and isinstance(step, int)
+                        and not isinstance(step, bool) and step >= 0):
+                    episodes[(str(transition[0]), episode, step)] = transition
+            anchors = sorted(samples, key=lambda item:
+                (float(bool(item[9].get('outcome_credit') or item[9].get('learning_screen_result')))
+                 if len(item) > 9 and isinstance(item[9], dict) else 0.0)
+                + min(1.0, abs(float(item[3]))), reverse=True)
+            chosen = 0
+            capacity = min(7, max(1, replay_count // 4))
+            for anchor in anchors[:8]:
+                detail = anchor[9] if len(anchor) > 9 and isinstance(anchor[9], dict) else {}
+                episode = detail.get('learning_episode_id')
+                step = detail.get('learning_step')
+                if not (isinstance(episode, str) and isinstance(step, int) and step >= 0):
+                    continue
+                for distance in (-1, 1, -2, 2):
+                    row = episodes.get((str(anchor[0]), episode, step + distance))
+                    if row is not None and append(row, 0.62 / (1.0 + 0.14 * abs(distance))):
+                        chosen += 1
+                    if chosen >= capacity:
+                        break
+                if chosen >= capacity:
+                    break
+            owner = self.games.get(self.game_key)
+            if owner is not None:
+                owner.diagnostics['sequential_replay_samples'] += chosen
         other_games = [(key, item) for key, item in self.games.items()
                        if key != self.game_key and len(item.exemplars) > 0]
         if other_games:
@@ -11151,9 +12011,9 @@ class Brain:
     def checkpoint_payload(self):
         return {
             'format': MODEL_FORMAT,
-            'feature_schema': 'spatiotemporal-object-relation-learned-visual-v9',
-            'reward_schema': 'dual-value-time-aware-region-causal-calibrated-v11',
-            'world_schema': 'scene-segment-holdout-relational-intent-v11',
+            'feature_schema': 'spatiotemporal-object-relation-multiscale-detail-v10',
+            'reward_schema': 'dual-value-time-aware-contradiction-calibrated-v12',
+            'world_schema': 'scene-segment-holdout-relational-intent-beam-v12',
             'goal_value_schema': 'dual-head-and-terminal-outcomes-v2',
             'feature_count': FEATURE_COUNT,
             'hidden_size': self.hidden_size,
@@ -11424,7 +12284,7 @@ class Brain:
                                 game.task_q[new_idx] = self.np.asarray(values, dtype=self.np.float32) if self.np is not None else values
                                 game.task_bias[new_idx] = number(goal_biases[old_idx], 0.0, -3.0, 3.0)
                                 game.task_q_samples[new_idx] = integer(goal_counts[old_idx])
-                for name in ('control', 'objective'):
+                for name in ('control', 'objective', 'information'):
                     rows = stored.get(name + '_head', [])
                     biases = stored.get(name + '_head_bias', [])
                     sample_counts = stored.get(name + '_head_samples', [])
@@ -11773,6 +12633,10 @@ class Brain:
                                                      number(value[1], 0.0, 0.0, 1000000.0),
                                                      number(value[2], 0.0, 0.0, 1000000.0),
                                                      str(value[3])[:90], min(4294967295, integer(value[4]))]
+                for context, values in list(records(stored.get('temporal_predictors', [])))[-192:]:
+                    if isinstance(context, str) and 1 <= len(context) <= 90 and isinstance(values, list) and len(values) == 7:
+                        if all(isinstance(value, (int, float)) and math.isfinite(value) and abs(value) <= 1000000 for value in values):
+                            game.temporal_predictors[context] = [number(value, 0.0, -4.0, 4.0) for value in values[:4]] + [number(values[4], 0.1, 0.0, 4.0), number(values[5], 0.1, 0.0, 4.0), min(1000000, integer(values[6]))]
                 for name, value in list(records(stored.get('goal_hypotheses', [])))[-160:]:
                     if (isinstance(name, str) and 1 <= len(name) <= 60 and isinstance(value, list)
                             and len(value) == 4):
@@ -11868,6 +12732,53 @@ class Brain:
         if self.storage_thread.is_alive():
             self.storage_problem = '存储线程尚未结束；未确认最后一次写入成功'
 
+def frame_response_metrics(before, after, targets=()):
+    if before is None or after is None or len(before) != W * H * 4 or len(after) != W * H * 4:
+        return {'global': 0.0, 'region_peak': 0.0, 'focused': 0.0, 'active_regions': 0}
+    amounts = [0.0] * 12
+    counts = [0] * 12
+    for y in range(3, H, 8):
+        for x in range(3, W, 8):
+            index = (y * W + x) * 4
+            amount = (abs(before[index] - after[index]) + abs(before[index + 1] - after[index + 1])
+                      + abs(before[index + 2] - after[index + 2])) / 765.0
+            region = min(2, y * 3 // H) * 4 + min(3, x * 4 // W)
+            amounts[region] += amount
+            counts[region] += 1
+    means = [amount / max(1, count) for amount, count in zip(amounts, counts)]
+    focused = 0.0
+    seen = set()
+    for target in list(targets)[:12]:
+        try:
+            if isinstance(target, dict):
+                u, v = float(target['x']), float(target['y'])
+            else:
+                u, v = float(target[0]), float(target[1])
+            if not math.isfinite(u) or not math.isfinite(v):
+                continue
+        except (TypeError, KeyError, IndexError, ValueError):
+            continue
+        x = max(0, min(W - 1, int(u * W)))
+        y = max(0, min(H - 1, int(v * H)))
+        cell = (x // 16, y // 16)
+        if cell in seen:
+            continue
+        seen.add(cell)
+        total = 0
+        count = 0
+        for dy in range(-14, 15, 4):
+            py = max(0, min(H - 1, y + dy))
+            for dx in range(-14, 15, 4):
+                px = max(0, min(W - 1, x + dx))
+                index = (py * W + px) * 4
+                total += abs(before[index] - after[index]) + abs(before[index + 1] - after[index + 1]) + abs(before[index + 2] - after[index + 2])
+                count += 1
+        focused = max(focused, total / max(1, count * 765))
+    return {'global': round(sum(amounts) / max(1, sum(counts)), 6),
+            'region_peak': round(max(means), 6), 'focused': round(focused, 6),
+            'active_regions': sum(value >= 0.075 for value in means)}
+
+
 class GameAgent:
     def __init__(self, native, folder, mode, stop_vk, own_hwnd, numpy_module):
         self.native, self.folder, self.mode, self.stop_vk, self.own_hwnd = native, folder, mode, stop_vk, own_hwnd
@@ -11893,6 +12804,7 @@ class GameAgent:
         self.same_error_count = 0
         self.last_recorded_error = 0.0
         self.last_status_written = 0.0
+        self.last_stage_progress = time.monotonic()
         self.phase = 'starting'
         self.last_capture_at = None
         self.last_input_at = None
@@ -11926,6 +12838,16 @@ class GameAgent:
         self.sensor_restarts = 0
         self.sensor_frames_total = 0
         self.monitor_breaks = 0
+        self.monitor_local_breaks = 0
+        self.monitor_candidate_sequence = -1
+        self.monitor_candidate_streak = 0
+        self.monitor_action_target = None
+        self.monitor_action_kind = None
+        self.monitor_camera_suppressed = 0
+        self.visual_effect_observations = 0
+        self.visual_no_effect_observations = 0
+        self.unverified_input_observations = 0
+        self.credible_goal_progress_events = 0
         self.last_visual_target_count = 0
         self.last_worker_check = 0.0
         self.stage_costs = OrderedDict()
@@ -11934,6 +12856,7 @@ class GameAgent:
         if not isinstance(elapsed, (int, float)) or not math.isfinite(elapsed) or elapsed < 0.0:
             return
         milliseconds = min(10000.0, 1000.0 * elapsed)
+        self.last_stage_progress = time.monotonic()
         old = self.stage_costs.get(stage, [0.0, 0])
         old[0] = 0.80 * old[0] + 0.20 * milliseconds if old[1] else milliseconds
         old[1] = min(100000000, old[1] + 1)
@@ -12001,6 +12924,7 @@ class GameAgent:
                 'stale_training_batches': self.brain.training_stale_batches if self.brain is not None else 0,
                 'terminal_credit_samples': self.brain.terminal_credit_samples if self.brain is not None else 0,
                 'training_updates': self.brain.updates if self.brain is not None else 0,
+                'last_stage_progress_age_seconds': round(max(0.0, time.monotonic() - self.last_stage_progress), 3),
                 'mean_abs_td_error': round(self.brain.td_error_ema, 6) if self.brain is not None else 0.0,
                 'total_proxy_reward': self.brain.total_reward if self.brain is not None else 0.0,
                 'learning_evidence_diagnostics': dict(self.brain.game.diagnostics) if self.brain is not None else {},
@@ -12051,6 +12975,13 @@ class GameAgent:
             'visual_game_switches': self.visual_game_switches,
             'continuous_capture_frames': self.sensor_frames_total,
             'actions_cut_short_by_visual_feedback': self.monitor_breaks,
+            'actions_cut_short_by_local_visual_feedback': self.monitor_local_breaks,
+            'camera_motion_action_interruptions_suppressed': self.monitor_camera_suppressed,
+            'screen_correlated_control_responses': self.brain.game.diagnostics['screen_correlated_control_responses'] if self.brain is not None else 0,
+            'visual_effect_confirmations': self.visual_effect_observations,
+            'visual_no_effect_confirmations': self.visual_no_effect_observations,
+            'visually_undetermined_inputs': self.unverified_input_observations,
+            'credible_goal_progress_events': self.credible_goal_progress_events,
             'touch_injection_supported': self.controller.touch_available if self.controller is not None else None,
             'last_capture_at': self.last_capture_at,
             'last_input_at': self.last_input_at,
@@ -12060,6 +12991,8 @@ class GameAgent:
             'capture_low_information_streak': self.capture.low_information_frames if self.capture is not None else None,
             'last_screen_signature': self.last_signature,
             'capture_backend': self.capture.backend if self.capture is not None else None,
+            'capture_backend_switches': self.capture.backend_switches if self.capture is not None else 0,
+            'capture_fast_backend_failures': self.capture.fast_backend_failures if self.capture is not None else 0,
             'capture_backend_problem': self.capture.backend_error if self.capture is not None else None,
             'sensor_thread_alive': bool(self.sensor_thread is not None and self.sensor_thread.is_alive()),
             'sensor_error': self.sensor_error,
@@ -12077,6 +13010,9 @@ class GameAgent:
             'stop_registered_channels': dict(self.listener.registered_channels) if self.listener is not None else {},
             'stop_registration_problem': self.listener.registration_error if self.listener is not None else None,
             'input_events_accepted_by_windows': self.controller.successful_inputs if self.controller is not None else 0,
+            'action_input_attempts': self.controller.attempted_action_inputs if self.controller is not None else 0,
+            'action_input_dispatches': self.controller.successful_action_inputs if self.controller is not None else 0,
+            'last_action_dispatch_at': self.controller.last_action_input_at if self.controller is not None else None,
             'game_received_input': None,
             'stop_detection': getattr(self.listener, 'mode', 'parent_supervised' if self.externally_supervised else 'fallback_poll'),
             'first_run_checks': {
@@ -12108,7 +13044,7 @@ class GameAgent:
     def check_stop_fallback(self):
         if self.stop_event.is_set():
             return True
-        return self.stop_gate.poll(allow_press=True)
+        return self.stop_gate.poll(allow_press=not self.externally_supervised)
 
     def ensure_listener(self):
         if self.externally_supervised:
@@ -12179,12 +13115,13 @@ class GameAgent:
                     if quality is not None:
                         local_capture.review_frame_quality(quality)
                     self.sensor_last_attempt = time.monotonic()
+                    capture_started_at = time.monotonic()
                     raw, rect = local_capture.grab()
                     captured_at = time.monotonic()
                     with self.sensor_condition:
                         self.sensor_sequence += 1
                         self.sensor_frames_total += 1
-                        self.sensor_frame = (raw, rect, captured_at, self.sensor_sequence)
+                        self.sensor_frame = (raw, rect, captured_at, self.sensor_sequence, capture_started_at)
                         self.sensor_error = None
                         self.sensor_last_success = captured_at
                         self.sensor_condition.notify_all()
@@ -12271,14 +13208,16 @@ class GameAgent:
         if self.capture is None:
             raise OSError(self.sensor_error or '图像采集线程未能初始化，请检查驱动和窗口状态')
 
-    def sample_frame(self, min_sequence=None, timeout=1.7, include_time=False):
+    def sample_frame(self, min_sequence=None, timeout=1.7, include_time=False, not_before_monotonic=None):
         start = time.monotonic()
         deadline = start + max(0.2, timeout)
         last_attempt = self.sensor_last_attempt
         with self.sensor_condition:
             while not self.stop_event.is_set():
                 frame = self.sensor_frame
-                if frame is not None and (min_sequence is None or frame[3] > min_sequence):
+                if (frame is not None and (min_sequence is None or frame[3] > min_sequence)
+                        and (not_before_monotonic is None or
+                             (len(frame) >= 5 and frame[4] >= not_before_monotonic))):
                     if time.monotonic() - frame[2] <= 2.0:
                         self.last_sensor_sequence = frame[3]
                         if self.brain is not None:
@@ -12344,16 +13283,39 @@ class GameAgent:
             return 'focus_lost'
         with self.sensor_condition:
             frame = self.sensor_frame
-        if frame is None or frame[3] <= self.last_sensor_sequence or old.raw is None or frame[1] != old.rect:
+        if (frame is None or frame[3] <= self.last_sensor_sequence or old.raw is None
+                or frame[1] != old.rect or frame[3] == self.monitor_candidate_sequence
+                or (getattr(self, 'controller', None) is not None and self.controller.action_first_input_at is not None
+                    and (len(frame) < 5 or frame[4] < self.controller.action_first_input_at))):
             return True
-        data = frame[0]
-        step = max(1, (W * H) // 150)
-        magnitude = sum(abs(data[i * 4] - old.raw[i * 4]) + abs(data[i * 4 + 1] - old.raw[i * 4 + 1]) + abs(data[i * 4 + 2] - old.raw[i * 4 + 2]) for i in range(0, W * H, step))
-        samples = len(range(0, W * H, step))
-        natural = max(old.change, self.brain.game.passive_change if self.brain is not None else 0.0)
-        threshold = max(0.23, min(0.52, 0.29 + natural * 1.6))
-        if magnitude / max(1, samples * 3 * 255) > threshold:
+        points = ([self.monitor_action_target] if self.monitor_action_target is not None else [])
+        points.extend(old.interaction_targets[:5])
+        points.extend(old.attention_points[:5])
+        points.extend(old.ui_text[:3])
+        response = frame_response_metrics(old.raw, frame[0], points)
+        natural = max(0.0, float(old.change), self.brain.game.passive_change if self.brain is not None else 0.0)
+        wide = response['global'] > max(0.23, min(0.55, 0.29 + natural * 1.5))
+        local_threshold = max(0.12, min(0.40, 0.085 + natural * 2.0))
+        local = (response['region_peak'] >= local_threshold
+                 and response['region_peak'] >= response['global'] * 1.9)
+        focused = (response['focused'] >= max(0.14, min(0.42, 0.085 + natural * 2.2))
+                   and response['focused'] >= response['global'] * 1.6)
+        self.monitor_candidate_sequence = frame[3]
+        if wide:
+            residual, displacement, camera_evidence = camera_frame_alignment(old.raw, frame[0])
+            if (camera_evidence >= 0.48 and displacement != (0, 0)
+                    and residual <= response['global'] * 0.76
+                    and (self.monitor_action_kind in ('look', 'aim', 'hold', 'pair_hold', 'move_fire', 'combat', 'compose', 'key')
+                         or not focused)):
+                self.monitor_camera_suppressed += 1
+                self.monitor_candidate_streak = 0
+                return True
             self.monitor_breaks += 1
+            return 'visual_change'
+        self.monitor_candidate_streak = min(4, self.monitor_candidate_streak + 1) if local or focused else 0
+        if self.monitor_candidate_streak >= 2:
+            self.monitor_breaks += 1
+            self.monitor_local_breaks += 1
             return 'visual_change'
         return True
 
@@ -12390,6 +13352,7 @@ class GameAgent:
             self.visual_game_switches += 1
         self.brain.previous_lum = None
         self.brain.previous_motion = None
+        self.brain.vision_model.previous_source = None
         self.brain.temporal_luma.clear()
         self.brain.last_attention_tracks = []
         self.brain.previous_camera_shift = (0.0, 0.0, 0.0)
@@ -12415,19 +13378,21 @@ class GameAgent:
             command_finished_at = start
         with self.sensor_condition:
             current_sequence = self.sensor_sequence
-        raw, newrect, captured_at = self.sample_frame(min_sequence=current_sequence, include_time=True)
+        raw, newrect, captured_at = self.sample_frame(min_sequence=current_sequence, include_time=True,
+                                                       not_before_monotonic=command_finished_at)
         self.last_capture_at = time.time()
         self.last_rect = newrect
         game = self.brain.game
         learned_delay = game.feedback_latency_by_kind.get(action.kind)
         delay = max(0.035, min(1.30, 0.75 * learned_delay[0] + 0.25 * game.feedback_delay)) if learned_delay else game.feedback_delay
-        if action.kind in ('move', 'look', 'aim', 'combat', 'hold', 'swipe', 'right_swipe'):
-            deadlines = (max(0.025, delay * 0.45), max(0.07, delay * 1.3))
-        else:
-            deadlines = (max(0.045, delay * 0.85), max(0.10, delay * 2.1))
-        if self.brain.step % 7 == 0 or (learned_delay and learned_delay[0] > 0.22):
-            deadlines = (*deadlines, min(1.30, max(0.32, delay * 3.5)))
-        if self.brain.step % 23 == 0:
+        latency_samples = int(learned_delay[1]) if learned_delay and len(learned_delay) > 1 else 0
+        response_rapid = action.kind in ('move', 'look', 'aim', 'combat', 'hold', 'swipe', 'right_swipe')
+        first = max(0.025, delay * (0.48 if response_rapid else 0.78))
+        second = max(0.07, delay * (1.28 if response_rapid else 1.70))
+        deadlines = (first, second)
+        if latency_samples < 4 or self.brain.step % 11 == 0 or delay > 0.22:
+            deadlines = (*deadlines, min(1.30, max(0.27, delay * 2.85)))
+        if self.brain.step % 53 == 0:
             deadlines = (*deadlines, max(deadlines[-1] + 0.07, 1.15))
         samples = [(raw, newrect)]
         captured_times = [captured_at]
@@ -12438,13 +13403,27 @@ class GameAgent:
                 break
             with self.sensor_condition:
                 current_sequence = self.sensor_sequence
-            raw, newrect, captured_at = self.sample_frame(min_sequence=current_sequence, include_time=True)
+            raw, newrect, captured_at = self.sample_frame(min_sequence=current_sequence, include_time=True,
+                                                           not_before_monotonic=command_finished_at)
             self.last_capture_at = time.time()
             self.last_rect = newrect
             samples.append((raw, newrect))
             captured_times.append(captured_at)
             frame_times.append(max(0.0, captured_at - first_input_at))
             post_action_frame_times.append(max(0.0, captured_at - start))
+            if len(samples) >= 2 and self.brain.step % 53 != 0:
+                sampling_stride = max(1, W * H // 400)
+                offsets = range(0, W * H, sampling_stride)
+                recent = samples[-1][0]
+                prior = samples[-2][0]
+                mean_drift = sum(abs(recent[i * 4] - prior[i * 4])
+                                 + abs(recent[i * 4 + 1] - prior[i * 4 + 1])
+                                 + abs(recent[i * 4 + 2] - prior[i * 4 + 2])
+                                 for i in offsets) / (max(1, len(offsets)) * 765.0)
+                elapsed = time.monotonic() - start
+                if (mean_drift < max(0.006, game.passive_change * 0.60)
+                        and elapsed >= max(0.06, delay * (0.85 if latency_samples >= 4 else 1.40))):
+                    break
         deltas = []
         recent_lum = []
         self.feedback_captures += 1
@@ -12472,7 +13451,16 @@ class GameAgent:
                          if response_index is not None else None)
         settled_at = (frame_times[-1] if len(frame_times) >= 2 and
                       frame_drift <= max(0.020, deltas[-1] * 0.36) else None)
-        return raw, newrect, {'response_onset_seconds': response_at,
+        focus_points = old.interaction_targets[:5] + old.attention_points[:5] + old.ui_text[:3]
+        if isinstance(detail, dict) and detail.get('spatial'):
+            focus_points = [(detail.get('start_x', 0.5), detail.get('start_y', 0.5))] + focus_points
+        spatial_response = frame_response_metrics(old.raw, samples[-1][0], focus_points)
+        return raw, newrect, {'post_action_frame_verified': all(t >= command_finished_at for t in captured_times),
+                              'response_onset_seconds': response_at,
+                              'regional_peak_change': spatial_response['region_peak'],
+                              'focused_change': spatial_response['focused'],
+                              'spatial_global_change': spatial_response['global'],
+                              'spatial_active_regions': spatial_response['active_regions'],
                               'response_settle_seconds': settled_at,
                               'response_after_command_seconds': after_command,
                               'response_onset_left_censored': response_censored,
@@ -12573,18 +13561,54 @@ class GameAgent:
                             parameters = (self.brain.consume_choice_parameters(obs, index)
                                           or self.brain.recommend_action_parameters(index, obs))
                         if action.kind == 'compose':
-                            parameters = self.brain.compose_action_parameters(obs, action, parameters)
+                            parameters = self.brain.compose_action_parameters(obs, action, parameters,
+                                                                             expand=saved_parameters is None)
                         self.note_stage_cost('parameter_selection', time.perf_counter() - parameters_started)
                         model_parameters = self.brain.parameter_dictionary(parameters, action, self.brain.stagnation)
                         self.last_decision = self.brain.decision_diagnostics(
                             obs, index, model_parameters, len(chosen_plan), expected_state is not None)
                         self.controller.guard = self.capture.is_target_focused if self.capture is not None else None
+                        pre_action_visual_change = 0.0
+                        with self.sensor_condition:
+                            latest_before_input = self.sensor_frame
+                        if (latest_before_input is not None and latest_before_input[1] == rect
+                                and obs.raw is not None and len(obs.raw) == len(latest_before_input[0])):
+                            current_raw = latest_before_input[0]
+                            pixel_stride = max(1, W * H // 800)
+                            positions = range(0, W * H, pixel_stride)
+                            pre_action_visual_change = sum(
+                                abs(obs.raw[i * 4] - current_raw[i * 4])
+                                + abs(obs.raw[i * 4 + 1] - current_raw[i * 4 + 1])
+                                + abs(obs.raw[i * 4 + 2] - current_raw[i * 4 + 2])
+                                for i in positions) / (max(1, len(positions)) * 765.0)
+                        if (pre_action_visual_change > max(0.095, self.brain.game.passive_change * 3.5)
+                                and latest_before_input is not None and latest_before_input[1] == rect
+                                and latest_before_input[3] > self.last_sensor_sequence):
+                            refreshed = self.brain.observe(latest_before_input[0], rect)
+                            self.last_sensor_sequence = latest_before_input[3]
+                            self.last_visual_target_count = len(refreshed.attention_points)
+                            self.last_capture_valid = refreshed.valid
+                            self.last_observation_quality = refreshed.quality
+                            self.last_signature = refreshed.signature
+                            self.note_frame_quality(refreshed.quality)
+                            obs = refreshed
+                            plan.clear()
+                            plan_parameters.clear()
+                            plan_predictions.clear()
+                            continue
+                        self.monitor_candidate_sequence = -1
+                        self.monitor_candidate_streak = 0
+                        self.monitor_action_target = ((float(model_parameters['start_x']), float(model_parameters['start_y']))
+                                                      if model_parameters.get('spatial') else None)
+                        self.monitor_action_kind = action.kind
                         execution_started = time.perf_counter()
                         completed = self.controller.execute(action, obs, rect, self.brain.stagnation, parameters,
                                                             monitor=(lambda previous=obs: self.action_monitor(previous)),
                                                             feedback_delay=self.brain.game.feedback_delay)
                         self.note_stage_cost('action_execution', time.perf_counter() - execution_started)
                         action_detail = self.controller.last_action_detail
+                        if isinstance(action_detail, dict):
+                            action_detail['pre_action_visual_change'] = round(pre_action_visual_change, 6)
                         self.last_input_at = time.time() if action_detail and action_detail.get('input_sent') else self.last_input_at
                         if self.check_stop_fallback():
                             break
@@ -12624,13 +13648,16 @@ class GameAgent:
                         feedback_started = time.perf_counter()
                         newraw, newrect, feedback = self.capture_action_feedback(obs, rect, action)
                         self.note_stage_cost('feedback_capture', time.perf_counter() - feedback_started)
-                        action_detail['feedback_valid'] = newrect == rect and bool(feedback.get('frame_deltas'))
+                        action_detail['feedback_valid'] = (newrect == rect and bool(feedback.get('frame_deltas'))
+                            and bool(feedback.get('post_action_frame_verified', False)))
                         action_detail['feedback_sample_count'] = len(feedback.get('frame_deltas', ()))
                         action_detail['response_onset_seconds'] = feedback.get('response_onset_seconds')
                         action_detail['response_settle_seconds'] = feedback.get('response_settle_seconds')
                         action_detail['response_after_command_seconds'] = feedback.get('response_after_command_seconds')
                         action_detail['response_onset_left_censored'] = feedback.get('response_onset_left_censored')
                         action_detail['response_is_screen_proxy'] = bool(feedback.get('response_is_screen_proxy'))
+                        action_detail['regional_peak_change'] = float(feedback.get('regional_peak_change') or 0.0)
+                        action_detail['focused_change'] = float(feedback.get('focused_change') or 0.0)
                         action_detail['feedback_elapsed_seconds'] = max(0.0, float(feedback.get('feedback_completed_monotonic', 0.0))
                             - float(feedback.get('feedback_started_monotonic', 0.0))) if 'feedback_completed_monotonic' in feedback else 0.0
                         times = feedback.get('frame_times', [])
@@ -12661,14 +13688,33 @@ class GameAgent:
                             self.safe_status(force=True)
                             continue
                         detail = None
+                        detail_extras = []
                         if self.brain.should_capture_detail(obs, action):
                             try:
                                 u, v = self.brain.detail_focus(obs, self.controller.last_action_detail)
                                 detail = self.sample_detail(newrect, u, v)
+                                if self.brain.step % 5 == 0 and self.brain.vision_cost_ema < 0.42:
+                                    focus_candidates = []
+                                    for item in obs.ui_text[:28]:
+                                        confidence = float(item.get('temporal_confidence', item.get('confidence', 0.0)))
+                                        fx, fy = float(item['x']), float(item['y'])
+                                        distance = math.hypot(fx - u, fy - v)
+                                        if distance >= 0.28:
+                                            focus_candidates.append(((0.40 + 0.60 * (1.0 - confidence)) * distance, fx, fy))
+                                    for fx, fy, strength in obs.attention_points[:30]:
+                                        distance = math.hypot(fx - u, fy - v)
+                                        if distance >= 0.33:
+                                            focus_candidates.append((0.18 * strength * distance, fx, fy))
+                                    if focus_candidates:
+                                        _, fx, fy = max(focus_candidates)
+                                    else:
+                                        fx, fy = (0.12 if u > 0.50 else 0.88), (0.12 if v > 0.50 else 0.88)
+                                    auxiliary = self.sample_detail(newrect, fx, fy)
+                                    detail_extras.append((auxiliary, (fx, fy)))
                             except Exception as exc:
                                 self.error(exc)
                         observation_started = time.perf_counter()
-                        following = self.brain.observe(newraw, newrect, detail)
+                        following = self.brain.observe(newraw, newrect, detail, detail_extras)
                         self.note_stage_cost('perception', time.perf_counter() - observation_started)
                         self.last_visual_target_count = len(following.attention_points)
                         self.last_capture_valid = following.valid
@@ -12686,8 +13732,27 @@ class GameAgent:
                             continue
                         learning_started = time.perf_counter()
                         reward, delta = self.brain.reward_for(obs, following, index, action_detail, feedback)
-                        if float(self.brain.reward_info.get('causal_confidence', 0.0)) >= 0.32 and float(self.brain.reward_info.get('persistent_visual_change', 0.0)) >= 0.35:
+                        response_verdict = self.brain.reward_info.get('action_effect_observation')
+                        response_confidence = float(self.brain.reward_info.get('action_effect_observation_confidence') or 0.0)
+                        action_detail['visual_action_effect_observed'] = (response_verdict == 1.0 if response_confidence >= 0.32 else None)
+                        action_detail['visual_action_effect_confidence'] = round(response_confidence, 5)
+                        action_detail['screen_response_correlated_with_action'] = bool(
+                            self.brain.reward_info.get('screen_response_correlated_with_action', False))
+                        action_detail['intervention_vs_passive_confidence'] = float(
+                            self.brain.reward_info.get('intervention_vs_passive_confidence') or 0.0)
+                        action_detail['game_input_received_verified'] = None
+                        action_detail['goal_progress_evidence'] = round(float(self.brain.reward_info.get('progress_confidence') or 0.0), 5)
+                        action_detail['goal_progress_is_screen_proxy'] = True
+                        if action_detail['visual_action_effect_observed'] is True:
+                            self.visual_effect_observations += 1
                             self.visual_input_effects += 1
+                        elif action_detail['visual_action_effect_observed'] is False:
+                            self.visual_no_effect_observations += 1
+                        else:
+                            self.unverified_input_observations += 1
+                        if (self.brain.reward_info.get('goal_progress_screen_correlated')
+                                and self.brain.reward_info.get('progress_signal', 0.0) > 0.0):
+                            self.credible_goal_progress_events += 1
                         episode_boundary = bool(self.brain.reward_info.get('episode_boundary', False))
                         if episode_boundary:
                             self.episode_boundaries += 1
@@ -12710,6 +13775,13 @@ class GameAgent:
                         prediction_failed = self.brain.plan_prediction_failed(expected_state, following, index, obs.signature)
                         effect_mismatch = bool((expected_state is not None or plan) and self.brain.plan_feedback_mismatch(
                             self.last_decision, self.brain.reward_info))
+                        phase_mismatch = bool(plan and obs.phase != following.phase
+                            and obs.phase != 'unknown' and following.phase != 'unknown'
+                            and min(obs.phase_confidence, following.phase_confidence) >= 0.57)
+                        uncertainty_mismatch = bool(plan and following.state_uncertainty >= 0.60
+                            and following.state_uncertainty - obs.state_uncertainty >= 0.24)
+                        if phase_mismatch or uncertainty_mismatch:
+                            self.brain.game.diagnostics['skill_online_replans'] += 1
                         if effect_mismatch:
                             prediction_failed = True
                             self.brain.game.diagnostics['plan_action_mismatches'] += 1
@@ -12717,12 +13789,15 @@ class GameAgent:
                             self.brain.mark_plan_result(chosen_plan, following, self.brain.reward_info,
                                                         steps_completed=len(chosen_plan) - len(plan))
                         self.events[-1]['plan_replan_reason'] = ('effect_mismatch' if effect_mismatch
+                                                                 else 'scene_phase_changed' if phase_mismatch
+                                                                 else 'uncertainty_increase' if uncertainty_mismatch
                                                                  else 'predicted_state_diverged' if prediction_failed else None)
                         skill_deviated = bool(plan and not self.brain.skill_should_continue(following, chosen_plan, len(chosen_plan) - len(plan)))
                         if skill_deviated and not episode_boundary:
                             self.brain.mark_plan_result(chosen_plan, following, self.brain.reward_info,
                                                         steps_completed=len(chosen_plan) - len(plan))
-                        if episode_boundary or prediction_failed or skill_deviated or not following.quality.get('trainable', False):
+                        if (episode_boundary or prediction_failed or skill_deviated or phase_mismatch
+                                or uncertainty_mismatch or not following.quality.get('trainable', False)):
                             plan.clear()
                             plan_parameters.clear()
                             plan_predictions.clear()
@@ -12800,6 +13875,7 @@ class GameAgent:
                             self.brain.previous_motion = None
                             self.brain.temporal_luma.clear()
                             self.brain.temporal_observations.clear()
+                            self.brain.vision_model.previous_source = None
                             self.brain.last_attention_tracks = []
                             self.brain.visual_tracks.clear()
                         if self.brain is not None:
@@ -13223,7 +14299,7 @@ def acceleration_for(folder, status):
     return None
 
 
-def profile_runtime(folder, module, capture_seconds=None, stop_vk=27):
+def profile_runtime(folder, module, capture_seconds=None, stop_vk=27, live_frame=None):
     probe = Brain.__new__(Brain)
     probe.np = module
     try:
@@ -13232,6 +14308,7 @@ def profile_runtime(folder, module, capture_seconds=None, stop_vk=27):
         probe.cv_np = None
     probe.hidden_size = MODEL_HIDDEN_SIZE
     probe.vision_model = VisualRepresentation()
+    probe.transfer_probes = deque(maxlen=24)
     probe.actions = actions_for(stop_vk)
     count = len(probe.actions)
     features = [((i * 17) % 39) / 39 for i in range(FEATURE_COUNT)]
@@ -13320,7 +14397,67 @@ def profile_runtime(folder, module, capture_seconds=None, stop_vk=27):
     result = {'backend': 'pure_python' if module is None else getattr(module, '__name__', 'numeric'),
               'python': sys.version.split()[0], 'offline_inference': True, 'offline_training': True,
               'capture_test_milliseconds': capture_seconds, 'action_count': count, **timings}
-    result['estimated_single_decision_milliseconds'] = round(timings['complete_visual_observation_milliseconds'] + timings['encoder_milliseconds'] + timings['action_head_milliseconds'], 3)
+    workspace = pathlib.Path(tempfile.mkdtemp(prefix='_runtime_measure_', dir=folder))
+    try:
+        complete = Brain(workspace, stop_vk, module)
+        try:
+            reference = complete.observe(textured, (0, 0, 1280, 720))
+            samples = []
+            for _ in range(7):
+                tick = time.perf_counter()
+                selected = complete.choose_plan(reference)
+                samples.append((time.perf_counter() - tick) * 1000.0)
+                if not selected or not all(0 <= index < len(complete.actions) for index in selected):
+                    raise ArithmeticError('完整规划基准返回了无效动作')
+            ordered = sorted(samples)
+            result['complete_plan_p50_milliseconds'] = round(ordered[len(ordered) // 2], 3)
+            result['complete_plan_p95_milliseconds'] = round(ordered[max(0, math.ceil(len(ordered) * 0.95) - 1)], 3)
+            result['complete_plan_max_milliseconds'] = round(ordered[-1], 3)
+            changed = bytearray(textured)
+            for index in range(0, W * H, 17):
+                changed[index * 4 + 1] = (changed[index * 4 + 1] + 30) % 255
+            tick = time.perf_counter()
+            following = complete.observe(bytes(changed), (0, 0, 1280, 720))
+            action = selected[0]
+            effect = {'input_sent': True, 'feedback_valid': True, 'kind': complete.actions[action].kind,
+                      'effective_elapsed_seconds': 0.22, 'duration': 0.22}
+            feedback = {'frame_deltas': [0.02, 0.02], 'frame_times': [0.03, 0.14],
+                        'settled_change': 0.02, 'frame_stability': 0.85,
+                        'hud_stability': 0.85, 'post_action_drift': 0.003, 'interval_deltas': [0.004]}
+            reward, magnitude = complete.reward_for(reference, following, action, effect, feedback)
+            complete.learn(reference, action, following, reward, magnitude, effect=effect)
+            result['synthetic_perception_feedback_learning_dispatch_milliseconds'] = round(
+                (time.perf_counter() - tick) * 1000.0, 3)
+            result['synthetic_feedback_finite'] = (math.isfinite(reward) and math.isfinite(magnitude))
+            result['synthetic_learning_dispatch_attempted'] = True
+            result['synthetic_learning_transition_accepted'] = complete.valid_transitions > 0
+            if live_frame is not None:
+                live_raw, live_rect = live_frame
+                if (isinstance(live_raw, bytes) and len(live_raw) == W * H * 4
+                        and len(live_rect) == 4 and live_rect[2] > 0 and live_rect[3] > 0):
+                    live_timings = []
+                    live_plan_timings = []
+                    live_quality = []
+                    for _ in range(3):
+                        tick = time.perf_counter()
+                        live_observation = complete.observe(live_raw, live_rect)
+                        live_timings.append((time.perf_counter() - tick) * 1000.0)
+                        live_quality.append(bool(live_observation.valid))
+                        tick = time.perf_counter()
+                        live_selected = complete.choose_plan(live_observation)
+                        live_plan_timings.append((time.perf_counter() - tick) * 1000.0)
+                        if not live_selected or not all(0 <= index < len(complete.actions) for index in live_selected):
+                            raise ArithmeticError('真实屏幕规划基准返回无效动作')
+                    result['real_screen_visual_observation_p50_milliseconds'] = round(sorted(live_timings)[1], 3)
+                    result['real_screen_plan_p50_milliseconds'] = round(sorted(live_plan_timings)[1], 3)
+                    result['real_screen_observation_valid'] = any(live_quality)
+                    result['real_screen_measurement_available'] = True
+        finally:
+            complete.close()
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+    result['estimated_single_decision_milliseconds'] = result.get('real_screen_plan_p50_milliseconds', result['complete_plan_p50_milliseconds'])
+    result['decision_benchmark_basis'] = ('full_choose_plan_real_screen_without_os_input' if result.get('real_screen_measurement_available') else 'full_choose_plan_synthetic_screen_without_os_input')
     destination = folder / 'runtime_profile.json'
     temporary = folder / 'runtime_profile.json.tmp'
     with temporary.open('w', encoding='utf-8') as file:
@@ -13985,10 +15122,12 @@ def verify_upgraded_components(agent, observation):
     original_model = agent.world_prediction
     original_scores = agent.scores
     original_steps = agent.game.world_network_steps
+    original_validation = agent.game.world_validation_samples[click]
     prior_planned = agent.last_plan_parameters
     plan_calls = []
     try:
         agent.game.world_network_steps = max(28, original_steps)
+        agent.game.world_validation_samples[click] = max(4, original_validation)
         agent.scores = lambda seen: [1.0 if i == click else -0.5 for i in range(len(agent.actions))]
         def mock_world(game, index, seen, executed=None):
             if index != click:
@@ -14007,6 +15146,7 @@ def verify_upgraded_components(agent, observation):
         agent.world_prediction = original_model
         agent.scores = original_scores
         agent.game.world_network_steps = original_steps
+        agent.game.world_validation_samples[click] = original_validation
         agent.last_plan_parameters = prior_planned
     assert len(agent.temporal_observations) <= 5
     return True
@@ -14016,9 +15156,7 @@ def verify_autonomous_learning_fixes(agent, observation):
     assert canonical_game_key('browser~g3') != canonical_game_key('browser')
     candidate = GameData(len(agent.actions), agent.hidden_size, agent.np)
     up, down = synthetic_control_pair(agent)
-    peer = agent.action_index.get('key:38', up)
-    if peer == up:
-        peer = agent.action_index['key:87']
+    peer = next(index for index in agent.intent_actions[agent.action_intents[up]] if index != up)
     view = Observation(observation.lum, observation.rgb, observation.salience, observation.motion,
                        observation.edges, observation.features[:], observation.signature,
                        observation.change, observation.novelty, observation.rect, observation.raw,
@@ -14188,7 +15326,7 @@ def verify_intelligence_extension(agent, observation):
     agent.games[test_key] = isolated
     agent.game_key = test_key
     try:
-        sequence = [control, agent.action_index['key:65']]
+        sequence = [control, next(index for index, action in enumerate(agent.actions) if action.kind == 'key')]
         agent.last_skill_source = old_game
         agent.last_transfer_key = 'synthetic_source:sequence'
         agent.last_skill_reference = '|'.join(agent.actions[index].id for index in sequence)
@@ -14299,8 +15437,7 @@ def verify_agent_improvement_regressions(agent, observation):
     initial, kinds = agent.hierarchical_probe_priorities(trial, observation, 'discovery', families)
     assert set(initial) == set(agent.action_families)
     assert all(math.isfinite(value) and value >= 0.0 for value in initial.values())
-    chosen = agent.action_index.get('key:87')
-    assert chosen is not None
+    chosen = synthetic_control_pair(agent)[0]
     context = agent.experiment_context(observation)
     trial.action_applicability[context + ':' + str(chosen)] = [8, 0.91, 0.1, 0.02]
     trial.control_posteriors[chosen] = [12.0, 1.0]
@@ -14346,7 +15483,8 @@ def verify_agent_improvement_regressions(agent, observation):
     assert agent.validate_world_prediction(trial, chosen, observation.features,
                                            observation.features, {'requested_duration': 0.15}) is not None
     assert trial.world_validation_samples[chosen] == 1
-    skill_key = 'key:87|key:83'
+    skill_actions = synthetic_control_pair(agent)
+    skill_key = '|'.join(agent.actions[index].id for index in skill_actions)
     trial.skills[skill_key] = {'expected_effect_path': [0.88], 'purpose': 'navigation',
                                'goal_signature': 'different', 'start_phase': 'unknown'}
     trial.recent.append((chosen, [], 0.0, 'prior',
@@ -14362,7 +15500,7 @@ def verify_agent_improvement_regressions(agent, observation):
                          observation.signature, observation.change, observation.novelty,
                          observation.rect, observation.raw, observation.hud, 'synthetic',
                          quality={'trainable': True, 'confidence': 0.95})
-    assert not stub.skill_should_continue(viewed, [agent.action_index['key:87'], agent.action_index['key:83']], 1)
+    assert not stub.skill_should_continue(viewed, list(skill_actions), 1)
     assert trial.diagnostics['skill_feedback_terminations'] == 1
     dummy = Brain.__new__(Brain)
     dummy.game_key = 'synthetic'
@@ -14437,7 +15575,7 @@ def verify_contextual_agent_repairs(agent, observation):
         assert weighted[action] > baseline[action] + 0.10
     finally:
         agent.game.scene_action_memory.pop(old_signature + ':' + str(action), None)
-    untested = agent.action_index['key:87']
+    untested = synthetic_control_pair(agent)[0]
     sample.action_attempts[untested] = 400
     alternate = agent.remap_skill_intent(sample, observation, untested)
     assert alternate != untested and agent.action_intents[alternate] == agent.action_intents[untested]
@@ -14794,9 +15932,12 @@ def verify_v20_regressions(agent, observation):
         game.prediction_error_mean = 0.032
         game.prediction_error_variance = 0.0001
         game.world_validation_samples[action_index] = 38
+        trial.observe(observation.raw, observation.rect)
         trial.set_game('unseen_game_transfer_v20')
-        assert trial.game.world_network is not None and trial.game.world_network_steps == 0
-        assert trial.game.diagnostics.get('world_transfer_bootstraps') == 1
+        assert trial.game.world_network is None and trial.game.world_network_steps == 0
+        trial.observe(observation.raw, observation.rect)
+        assert trial.game.world_network is None and trial.game.world_network_steps == 0
+        assert not trial.game.diagnostics.get('world_transfer_bootstraps')
         trial.set_game('desktop')
         trial.save(force=True)
     finally:
@@ -14820,7 +15961,8 @@ def verify_v20_regressions(agent, observation):
     gate = StopKeyGate(fake, agent.stop_vk, stopped)
     gate.prefer_trusted_sources(True)
     device.value = 0x8000
-    assert gate.poll() and stopped.is_set()
+    assert not gate.poll() and not stopped.is_set()
+    assert gate.observe(True) and stopped.is_set()
     assert not gate.observe(True, physical=False) and stopped.is_set()
     assert not gate.observe(True, physical=True) and stopped.is_set()
     class SyntheticKeyboard:
@@ -14851,8 +15993,122 @@ def verify_v20_regressions(agent, observation):
     assert controller.last_action_detail['a'] == params[6]
     assert controller.last_action_detail['spatial'] and keyboard.mouse >= 2
     assert keyboard.keys and not any(stop_equivalent(code, agent.stop_vk) for code in keyboard.keys)
-    assert not controller.down and not controller.mouse_down
+    assert params[6] in controller.down and MOUSEEVENTF_LEFTDOWN in controller.mouse_down
+    assert controller.release() and not controller.down and not controller.mouse_down
     return True
+
+
+def verify_v23_regressions(agent, observation):
+    visual = VisualRepresentation()
+    base = [(110, 110, 110)] * (GW * GH)
+    detailed = base[:]
+    for row in range(GH):
+        for col in range(0, GW, 5):
+            detailed[row * GW + col] = (180, 180, 180)
+            detailed[row * GW + col + 1] = (40, 40, 40)
+    motion = [0.0] * (GW * GH)
+    edges = [0.04] * (GW * GH)
+    visual.observe(base, motion, edges)
+    coarse = visual.previous_source[:]
+    visual.observe(detailed, motion, edges)
+    fine = visual.previous_source[:]
+    assert len(fine) == VISUAL_SOURCE_COUNT
+    assert max(abs(x - y) for x, y in zip(coarse[:128], fine[:128])) < 0.000001
+    assert sum(abs(x - y) for x, y in zip(coarse[128:384], fine[128:384])) > 0.1
+    visual.observe(base, motion, edges, fine_detail=[0.65] * 32)
+    assert visual.previous_source[-32:] == [0.65] * 32
+    assert VisualRepresentation().restore(json.loads(json.dumps(visual.export())))
+    workspace = pathlib.Path(tempfile.mkdtemp(prefix='_v23_intelligence_', dir=agent.folder))
+    trial = None
+    restored = None
+    try:
+        trial = Brain(workspace, agent.stop_vk, agent.np)
+        trial.game.goal_hypotheses['meter:score'] = [22.0, 1.0, 1.0, 18.0]
+        previous = Observation(observation.lum, observation.rgb, observation.salience, observation.motion,
+            observation.edges, observation.features[:], observation.signature, observation.change,
+            observation.novelty, observation.rect, observation.raw, observation.hud,
+            trial.game_key, quality=observation.quality.copy())
+        positive, _ = trial.objective_signal(trial.game, previous, previous, 0.95, 0.95, 0.95,
+            {'meter_changes': [{'region': 'score', 'relative_delta': 0.45}]})
+        assert positive > 0.0 and trial.game.goal_signal_conflict < 0.05
+        trial.game.goal_hypotheses['meter:score'] = [12.0, 12.0, 1.0, 18.0]
+        ambiguous, _ = trial.objective_signal(trial.game, previous, previous, 0.95, 0.95, 0.95,
+            {'meter_changes': [{'region': 'score', 'relative_delta': 0.45}]})
+        assert abs(ambiguous) < positive and trial.game.goal_signal_conflict >= 0.75
+        assert trial.game.diagnostics['rejected_proxy_goals'] > 0
+        for tick in range(8):
+            probe = Observation(observation.lum, observation.rgb, observation.salience, observation.motion,
+                observation.edges, observation.features[:], observation.signature, observation.change,
+                observation.novelty, observation.rect, observation.raw, observation.hud,
+                trial.game_key, quality=observation.quality.copy())
+            probe.quality['confidence'] = 0.99
+            probe.phase = 'playing'
+            probe.phase_confidence = 0.95
+            probe.scene_identity = 'v23_temporal_tracking'
+            probe.objects = [
+                {'track_id': 1, 'age': 9, 'x': 0.20 + tick * 0.014, 'y': 0.40,
+                 'vx': 0.28, 'vy': 0.0, 'confidence': 0.99, 'control_probability': 0.99},
+                {'track_id': 2, 'age': 9, 'x': 0.80, 'y': 0.40, 'vx': 0.0, 'vy': 0.0,
+                 'confidence': 0.96, 'control_probability': 0.01}]
+            probe.interaction_targets = [{'x': 0.80, 'y': 0.40, 'confidence': 0.95, 'priority': 0.9}]
+            probe.ui_text = [{'temporal_confidence': 0.96, 'confidence': 0.96}]
+            probe.hud_meters = {'progress': 0.20 + tick * 0.02}
+            forecast = trial.update_belief_state(probe)
+        context = 'v23_temporal_tracking:playing'
+        assert context in trial.game.temporal_predictors
+        assert trial.game.temporal_predictors[context][6] >= 6
+        assert forecast['forecast_confidence'] > 0.12 and forecast['forecast_closing'] > -0.01
+        assert any(item[0] == context for item in trial.game.export()['temporal_predictors'])
+        duration_index = next(i for i, action in enumerate(trial.actions) if action.kind == 'hold')
+        duration_action = trial.actions[duration_index]
+        fixed = (0.5, 0.5, 0.40, 1.0, 0.80)
+        original_parameters = trial.recommend_action_parameters
+        trial.recommend_action_parameters = lambda index, obs, commit_focus=False: fixed
+        try:
+            context = trial.experiment_context(observation)
+            key = context + ':' + duration_action.id + ':-1:-1:0.240:0.7'
+            trial.game.joint_parameter_stats[key] = [48, 1.0, 1.0, 0.0]
+            selected = trial.choose_joint(observation, [duration_index])
+            parameters = trial.consume_choice_parameters(observation, selected)
+            assert selected == duration_index and parameters is not None
+            assert abs(parameters[2] - 0.248) < 0.00001
+            assert trial.game.diagnostics['parameter_trials'] >= 3
+        finally:
+            trial.recommend_action_parameters = original_parameters
+        chosen = trial.select_experiment(trial.game, observation, 'discovery',
+            {family: 0 for family in trial.action_families})
+        assert chosen in trial.experiment_joint_candidates
+        assert 1 <= len(trial.experiment_joint_candidates) <= 4
+        assert all(0 <= index < len(trial.actions) for index in trial.experiment_joint_candidates)
+        episode = uuid.uuid4().hex
+        transitions = []
+        for tick in range(48):
+            state = observation.features[:]
+            state[1] = tick / 60.0
+            info = {'uid': uuid.uuid4().hex, 'input_sent': True, 'feedback_valid': True,
+                'learning_effect_confidence': 0.94, 'learning_effect_observation': 1.0,
+                'learning_scene_phase': 'playing', 'learning_state_context': 'v23_test_' + str(tick),
+                'learning_episode_id': episode, 'learning_step': tick,
+                'outcome_credit': tick == 24}
+            transitions.append([trial.game_key, state, duration_index, 0.12, state[:],
+                                0.8, False, 1, 0.94, info])
+        trial.memory.extend(transitions)
+        trial.rng.seed(3917)
+        selected_samples, weights = trial.sample_replay([transitions[24]], 6)
+        assert trial.game.diagnostics['sequential_replay_samples'] >= 1
+        assert len(selected_samples) > 1 and all(id(item) in weights for item in selected_samples)
+        trial.save(force=True)
+        trial.close()
+        trial = None
+        restored = Brain(workspace, agent.stop_vk, agent.np)
+        assert context in restored.game.temporal_predictors or 'v23_temporal_tracking:playing' in restored.game.temporal_predictors
+        return True
+    finally:
+        if restored is not None:
+            restored.close()
+        if trial is not None:
+            trial.close()
+        shutil.rmtree(workspace, ignore_errors=True)
 
 
 def verify_rendered_closed_loop(folder, stop_vk, backend):
@@ -14988,7 +16244,7 @@ if sys.platform == 'win32':
     if win.com_initialized:
         win.ole.CoUninitialize()
 multi = engine.NativeDXGI.__new__(engine.NativeDXGI)
-multi.outputs = [((0, 0, 4, 2), None), ((4, 0, 8, 2), None)]
+multi.outputs = [((0, 0, 4, 2), None, 0, 1), ((4, 0, 8, 2), None, 0, 1)]
 multi.pitch = 16
 multi.frame_protected = False
 multi.buffer = None
@@ -15000,6 +16256,81 @@ assert mixed is not None and len(mixed) == 64
 assert mixed[:4] == bytes((20, 40, 70, 255))
 assert mixed[16:20] == bytes((20, 160, 70, 255))
 assert mixed[32:36] == bytes((20, 40, 70, 255))
+for rotation, expected in ((1, (1, 0)), (2, (0, 2)), (3, (2, 1)), (4, (1, 1))):
+    multi.outputs = [((0, 0, 4, 2), None, 0, rotation)]
+    multi.buffer_width, multi.buffer_height = (2, 4) if rotation in (2, 4) else (4, 2)
+    x, y = multi._source_xy(0, 1, 0)
+    assert (x, y) == expected
+for region in ((1280, 720), (1024, 768), (1080, 1920), (2520, 1080)):
+    image_rect = (37, 53, *region)
+    ox, oy, vw, vh = engine.capture_viewport(image_rect)
+    assert 0 <= ox < engine.W and 0 <= oy < engine.H
+    assert 0 < vw <= engine.W and 0 < vh <= engine.H
+    composed = engine.compose_capture_frame(bytes((40, 110, 230, 255)) * (vw * vh), engine.W, engine.H, ox, oy, vw, vh)
+    assert len(composed) == engine.W * engine.H * 4
+    for ux, uy in ((0.25, 0.50), (0.55, 0.75), (0.50, 0.50)):
+        encoded_u = (ox + ux * vw) / engine.W
+        encoded_v = (oy + uy * vh) / engine.H
+        actual_u, actual_v = engine.image_point_to_rect(encoded_u, encoded_v, image_rect)
+        assert abs(actual_u - ux) < 1e-6 and abs(actual_v - uy) < 1e-6
+base_frame = bytes((12, 18, 24, 255)) * (engine.W * engine.H)
+local_frame = bytearray(base_frame)
+for y in range(41, 66):
+    for x in range(81, 106):
+        pos = (y * engine.W + x) * 4
+        local_frame[pos:pos + 3] = bytes((244, 238, 208))
+local_frame = bytes(local_frame)
+regions = engine.frame_response_metrics(base_frame, local_frame, [(0.29, 0.29)])
+assert regions['focused'] > 0.20 and regions['focused'] > regions['global'] * 2
+assert regions['region_peak'] > regions['global'] * 3
+pattern = bytearray(engine.W * engine.H * 4)
+shifted = bytearray(len(pattern))
+for row in range(engine.H):
+    for col in range(engine.W):
+        tone = (col * 23 + row * 13 + (col * row) % 251) % 256
+        pos = (row * engine.W + col) * 4
+        pattern[pos:pos + 4] = bytes((tone, (tone * 3) % 256, (tone * 7) % 256, 255))
+for row in range(engine.H):
+    for col in range(engine.W):
+        pos = (row * engine.W + col) * 4
+        shifted[pos:pos + 4] = (pattern[pos - 32:pos - 28] if col >= 8
+                                else bytes((17, 17, 17, 255)))
+residual, shift, certainty = engine.camera_frame_alignment(bytes(pattern), bytes(shifted))
+assert shift == (8, 0) and certainty > 0.60 and residual < 0.01
+assert engine.action_response_evidence([0.060, 0.085, 0.075], 0.005, 0.008, 0.002, 0.95) > 0.55
+assert engine.action_response_evidence([0.010, 0.012, 0.011], 0.01, 0.015, 0.009, 0.40) < 0.10
+class NonGameWindowUser:
+    def GetForegroundWindow(self):
+        return 42
+cap = engine.Capture.__new__(engine.Capture)
+cap.n = type('MockNative', (), {'user': NonGameWindowUser()})()
+cap.target_candidate = None
+cap.target_candidate_count = 0
+cap.target_candidate_since = 0.0
+cap.target_candidate_frame = None
+cap.target_candidate_motion = 0.0
+cap.target_candidate_texture = 0.0
+cap.target_candidate_last_probe = 0.0
+cap._candidate_is_game_like = lambda selected: False
+cap._candidate_visual_evidence = lambda hwnd: False
+for _ in range(7):
+    assert not cap._stable_window_candidate((100, 42, (9001, 'generic', '', 'ordinary window')), 0.0)
+cap._candidate_visual_evidence = lambda hwnd: True
+cap.target_candidate_since = engine.time.monotonic() - 2.5
+cap.target_candidate_count = 4
+cap.target_candidate_texture = 0.11
+assert cap._stable_window_candidate((100, 42, (9001, 'generic', '', 'ordinary window')), 0.0)
+cap.target_candidate_texture = 0.001
+cap.target_candidate_motion = 0.0
+assert not cap._stable_window_candidate((100, 42, (9001, 'generic', '', 'ordinary window')), 0.0)
+assert engine.supervisor_stall_reason({'phase': 'acting', 'stage_progress_age': 125,
+    'sensor_progress_age': 0, 'stage_costs': {'action_execution': 350}}, 140, 0, 139, 10, 139, 10, 139, 10, True)
+assert engine.supervisor_stall_reason({'phase': 'learning', 'stage_progress_age': 65,
+    'sensor_progress_age': 65, 'stage_costs': {'perception': 350}}, 100, 0, 99, 10, 10, 10, 99, 10, True) is None
+assert engine.supervisor_stall_reason({'phase': 'learning', 'stage_progress_age': 1,
+    'sensor_progress_age': 1, 'stage_costs': {}}, 100, 0, 75, 90, 90, 90, 99, 90, True) is None
+assert engine.supervisor_stall_reason({'phase': 'acting', 'stage_progress_age': 1,
+    'sensor_progress_age': 1, 'stage_costs': {}}, 100, 90, 99, 99, 99, 99, 99, 99, True) is None
 class FakeUser:
     def __init__(self):
         self.pressed = False
@@ -15036,13 +16367,38 @@ flag = engine.threading.Event()
 control = engine.Controller(fake, stop_vk, flag)
 control.ledger_path = workspace / 'active_inputs.json'
 control.stop_gate = engine.StopKeyGate(fake, stop_vk, flag)
+saved_state_reader = fake.user.GetAsyncKeyState
+fake.user.GetAsyncKeyState = lambda key: 1
+lsb_gate = engine.StopKeyGate(fake, stop_vk, engine.threading.Event())
+assert not lsb_gate.poll() and not lsb_gate.stop_event.is_set()
+fake.user.GetAsyncKeyState = saved_state_reader
 assert control.key(stop_vk, True) is False and fake.user.accepted == 0
+assert engine.temporal_response_confidence([0.06, 0.07, 0.068], [0.01, 0.005], 0.002, 0.95) > engine.temporal_response_confidence([0.06, 0.08, 0.008], [0.07, 0.07], 0.01, 0.10)
+class WorkerIdentity:
+    pid = 12345
+progress_path = workspace / 'worker_heartbeat.json'
+progress_path.write_text(engine.json.dumps({'build': engine.SOURCE_BUILD, 'session': 'test-session', 'pid': 12345, 'at': engine.time.time(), 'steps': 12}), encoding='utf-8')
+assert engine.worker_progress_snapshot(workspace, 'test-session', WorkerIdentity())['steps'] == 12
+assert engine.worker_progress_snapshot(workspace, 'another-session', WorkerIdentity()) is None
+progress_path.unlink()
 candidate = next(v for v in (65, 66, 67, 68, 70, 71, 72) if not engine.stop_equivalent(v, stop_vk))
 assert control.key(candidate, True) and control.down == {candidate}
 assert engine.json.loads(control.ledger_path.read_text(encoding='utf-8'))['keys'] == [candidate]
 control.release()
 assert not engine.json.loads(control.ledger_path.read_text(encoding='utf-8'))['keys']
 assert not control.down and fake.user.accepted == 2
+composed_keys = [key for key in (65, 66, 67, 68, 69, 70) if not engine.stop_equivalent(key, stop_vk)][:3]
+composed_action = engine.Action('compose:regression', 'compose', duration=0.025)
+compose_observation = type('ComposeObservation', (), {'change': 0.0})()
+settings = (0.5, 0.5, 0.025, 1.0, 0.8, 'compose', *composed_keys[:2], False, composed_keys[2])
+assert control.execute(composed_action, compose_observation, (0, 0, 1280, 720), 0, parameters=settings)
+assert control.last_action_detail['c'] == composed_keys[2]
+assert all(key in control.down for key in composed_keys)
+assert control.release() and not control.down
+blocked_settings = settings[:9] + (stop_vk,)
+assert control.execute(composed_action, compose_observation, (0, 0, 1280, 720), 0, parameters=blocked_settings)
+assert control.last_action_detail['c'] == 0 and stop_vk not in control.down
+assert control.release() and not control.down
 assert control.key(candidate, True)
 fake.user.fail_release_count = 5
 try:
@@ -15068,10 +16424,41 @@ fake.user.pressed = True
 assert control.stop_gate.poll() and flag.is_set()
 assert not control.key(candidate, True)
 assert not control.down
+monitor_agent = engine.GameAgent.__new__(engine.GameAgent)
+monitor_agent.stop_event = engine.threading.Event()
+monitor_agent.externally_supervised = True
+monitor_agent.capture_is_stale = lambda: False
+monitor_agent.mode = '全屏'
+monitor_agent.brain = type('MockBrain', (), {'game': type('MockGame', (), {'passive_change': 0.001})()})()
+monitor_agent.sensor_condition = engine.threading.Condition()
+monitor_agent.last_sensor_sequence = 0
+monitor_agent.monitor_candidate_sequence = -1
+monitor_agent.monitor_candidate_streak = 0
+monitor_agent.monitor_action_target = (0.29, 0.29)
+monitor_agent.monitor_breaks = 0
+monitor_agent.monitor_local_breaks = 0
+old_screen = type('MockObservation', (), {'rect': (0, 0, 1280, 720), 'raw': base_frame,
+    'change': 0.001, 'interaction_targets': [], 'attention_points': [], 'ui_text': []})()
+monitor_agent.sensor_frame = (local_frame, old_screen.rect, engine.time.monotonic(), 11)
+assert monitor_agent.action_monitor(old_screen) is True
+monitor_agent.sensor_frame = (local_frame, old_screen.rect, engine.time.monotonic(), 12)
+assert monitor_agent.action_monitor(old_screen) == 'visual_change' and monitor_agent.monitor_local_breaks == 1
+monitor_agent.monitor_camera_suppressed = 0
+monitor_agent.monitor_action_kind = 'look'
+monitor_agent.sensor_frame = (bytes(shifted), old_screen.rect, engine.time.monotonic(), 13)
+camera_observation = type('CameraObservation', (), {'rect': old_screen.rect, 'raw': bytes(pattern),
+    'change': 0.005, 'interaction_targets': [], 'attention_points': [], 'ui_text': []})()
+assert monitor_agent.action_monitor(camera_observation) is True
+assert monitor_agent.monitor_camera_suppressed == 1
 numeric = importlib.import_module(backend) if backend != 'none' else None
 assert engine.validate_learning_backend(numeric)
 visual = engine.VisualRepresentation()
 assert engine.VisualRepresentation().restore(engine.json.loads(engine.json.dumps(visual.export())))
+fast_visual = engine.VisualRepresentation(numeric)
+visual_input = [(0.42, 0.48, 0.51)] * (engine.GW * engine.GH)
+latent = fast_visual.observe(visual_input, [0.02] * len(visual_input), [0.13] * len(visual_input))
+assert len(latent) == engine.VISUAL_LATENT_COUNT and all(engine.math.isfinite(value) for value in latent)
+assert engine.VisualRepresentation().restore(engine.json.loads(engine.json.dumps(fast_visual.export())))
 store = engine.ReplayStore(workspace)
 try:
     assert store.verify_roundtrip()
@@ -15119,6 +16506,7 @@ try:
     assert engine.verify_targeted_repairs(agent, before)
     assert engine.verify_integrated_intelligence_repairs(agent, before)
     assert engine.verify_v20_regressions(agent, before)
+    assert engine.verify_v23_regressions(agent, before)
     assert engine.verify_rendered_closed_loop(workspace, stop_vk, numeric)
     def render_simulation(position, score):
         pixels = bytearray(bytes((30, 38, 43, 255)) * (engine.W * engine.H))
@@ -15196,6 +16584,15 @@ try:
         assert 'click' in agent.game.feedback_latency_by_kind
         assert 0.035 <= agent.game.feedback_latency_by_kind['click'][0] <= 0.60
     agent.learn(before, index, after, learned_reward, measured_change, done=True, effect=action_effect)
+    control_before = float(agent.game.control_head_bias[index])
+    objective_before = float(agent.game.objective_head_bias[index])
+    information_before = agent.dual_value_scores(agent.game, before)[index]
+    assert agent.update_dual_values(agent.game, before, index,
+                                    information=0.85, information_confidence=0.92)
+    assert agent.game.information_head_samples[index] >= 1
+    assert agent.dual_value_scores(agent.game, before)[index] > information_before
+    assert float(agent.game.control_head_bias[index]) == control_before
+    assert float(agent.game.objective_head_bias[index]) == objective_before
     assert agent.step == 1
     initial_world_counts = sum(row[1] for row in agent.game.world.values())
     agent.game.passive_samples = 4
@@ -15283,6 +16680,8 @@ try:
     assert len(restored.game.world_events[event_context]) == 12
     assert restored.game.control_head_samples[index] > 0
     assert restored.game.objective_head_samples[index] > 0
+    assert restored.game.information_head_samples[index] > 0
+    assert abs(float(restored.game.information_head_bias[index])) > 0.00001
     assert abs(float(restored.game.control_head_bias[index])) > 0.00001
     assert abs(float(restored.game.objective_head_bias[index])) > 0.00001
     assert restored.game.world_validation_samples[index] >= 1
@@ -15294,6 +16693,13 @@ try:
     assert restored.game.spatial_context_stats[synthetic_context + ':click:3:4'][0] == 6
     assert restored.game.duration_context_stats[synthetic_context + ':click:0.15'][0] == 6
     assert sum(restored.game.action_attempts) >= 1
+    if numeric is not None:
+        assert restored.recover_backend()
+        assert engine.json.loads(engine.json.dumps(restored.game.export()))['information_head_samples'][index] >= 1
+        assert len(restored.game.task_q) == len(restored.actions)
+        assert (isinstance(restored.game.task_q, list) if backend == 'numpy'
+                else hasattr(restored.game.task_q, 'shape'))
+        restored.save(force=True)
 finally:
     restored.close()
 inspection = engine.inspect_checkpoint_bundle(workspace)
@@ -15301,16 +16707,25 @@ assert inspection['restores_latest'] and inspection['base_step'] >= 1
 class DesktopNative:
     def desktop(self):
         return workspace
+(workspace / 'worker_stderr.log').write_text('SYNTHETIC_WORKER_ERROR\\n' * 64, encoding='utf-8')
+(workspace / 'worker_heartbeat.json').write_text(engine.json.dumps({'build': engine.SOURCE_BUILD,
+    'session': 'synthetic', 'pid': 12345, 'phase': 'acting', 'at': engine.time.time()},
+    ensure_ascii=False), encoding='utf-8')
 archive_path = engine.blackbox(DesktopNative(), workspace, None, mode, stop_vk)
 assert archive_path.stat().st_size <= 1000000
 with engine.zipfile.ZipFile(archive_path) as archive:
     assert 'report.json' in archive.namelist()
     metadata = engine.json.loads(archive.read('report.json'))
     assert metadata['mode'] == mode
+    assert metadata['archive_contents']['worker_stderr_included']
+    assert metadata['archive_contents']['worker_heartbeat_included']
+    assert 'worker_stderr_tail.log' in archive.namelist()
+    assert 'worker_heartbeat.json' in archive.namelist()
     assert 'pre_update_world_validation_samples' in metadata
     assert 'learning_evidence_diagnostics' in metadata
     assert 'dual_control_head_population' in metadata
     assert 'dual_objective_head_population' in metadata
+    assert 'information_value_head_population' in metadata
 archive_path.unlink()
 probe = engine.Brain.__new__(engine.Brain)
 probe.actions = [engine.Action('test', 'key')]
@@ -15454,6 +16869,69 @@ def inspect_checkpoint_bundle(folder):
     return result
 
 
+def read_blackbox_history(folder, limit=250):
+    database = pathlib.Path(folder) / 'experience.sqlite3'
+    if not database.is_file():
+        return [], None, {}, 'experience_database_not_found'
+    address = 'file:' + urllib.parse.quote(str(database.resolve()).replace('\\', '/'), safe='/:') + '?mode=ro'
+    connection = None
+    try:
+        connection = sqlite3.connect(address, uri=True, timeout=1.5)
+        connection.execute('PRAGMA query_only=ON')
+        if int(connection.execute('PRAGMA user_version').fetchone()[0]) != MODEL_FORMAT:
+            return [], None, {}, 'experience_database_version_mismatch'
+        required = {'at', 'game', 'action', 'reward', 'change', 'done', 'confidence', 'action_detail', 'feature_version'}
+        fields = {column[1] for column in connection.execute('PRAGMA table_info(transitions)')}
+        image_fields = {column[1] for column in connection.execute('PRAGMA table_info(keyframes)')}
+        if not required.issubset(fields) or not {'valid', 'width', 'height', 'frame'}.issubset(image_fields):
+            return [], None, {}, 'experience_database_schema_mismatch'
+        if connection.execute('SELECT 1 FROM transitions WHERE feature_version<>? LIMIT 1', (MODEL_FORMAT,)).fetchone():
+            return [], None, {}, 'experience_database_mixed_versions'
+        count = int(connection.execute('SELECT COUNT(*) FROM transitions').fetchone()[0])
+        frames = int(connection.execute('SELECT COUNT(*) FROM keyframes').fetchone()[0])
+        rows = connection.execute('SELECT at,game,action,reward,change,done,confidence,action_detail FROM transitions ORDER BY id DESC LIMIT ?', (max(1, min(350, int(limit))),)).fetchall()
+        actions = []
+        detail_fields = ('kind', 'a', 'b', 'x', 'y', 'duration', 'input_sent', 'sent_events', 'interrupted',
+                         'interruption_reason', 'feedback_valid', 'response_onset_seconds', 'learning_causality',
+                         'learning_action_effect', 'learning_objective_signal', 'learning_information_signal',
+                         'learning_objective_tier', 'learning_goal_confidence', 'learning_screen_result',
+                         'outcome_credit', 'credit_confidence', 'game_input_received_verified', 'early_visual_feedback',
+                         'pre_action_visual_change')
+        for at, game, action, reward, change, done, confidence, details in reversed(rows):
+            try:
+                parsed = json.loads(details) if isinstance(details, str) else {}
+            except (ValueError, TypeError, json.JSONDecodeError):
+                parsed = {}
+            parsed = parsed if isinstance(parsed, dict) else {}
+            actions.append({'t': round(float(at), 3), 'game': game, 'action': action,
+                            'reward': round(float(reward), 6), 'change': round(float(change), 6),
+                            'done': bool(done), 'confidence': round(float(confidence), 4),
+                            'detail': {key: parsed[key] for key in detail_fields if key in parsed}})
+        picture = None
+        for (compressed,) in connection.execute('SELECT frame FROM keyframes WHERE valid=1 AND width=? AND height=? ORDER BY id DESC LIMIT 4', (W, H)):
+            try:
+                if len(compressed) > W * H * 4 + 4096:
+                    continue
+                unpacker = zlib.decompressobj()
+                pixels = unpacker.decompress(compressed, W * H * 4 + 1)
+                if len(pixels) == W * H * 4 and unpacker.eof and not unpacker.unused_data:
+                    picture = pixels
+                    break
+            except (zlib.error, ValueError, TypeError):
+                continue
+        statistics = {'persisted_transitions': count, 'persisted_keyframes': frames,
+                      'latest_recorded_game': actions[-1]['game'] if actions else None,
+                      'latest_recorded_action_at': actions[-1]['t'] if actions else None,
+                      'recent_actions_available': len(actions), 'screen_from_valid_keyframe': picture is not None,
+                      'source': 'current_build_experience.sqlite3'}
+        return actions, picture, statistics, None
+    except (sqlite3.DatabaseError, OSError, ValueError, TypeError) as exc:
+        return [], None, {}, f'{type(exc).__name__}: {str(exc)[:180]}'
+    finally:
+        if connection is not None:
+            connection.close()
+
+
 def blackbox(native, folder, agent, mode, stop_vk):
     destination = native.desktop()
     destination.mkdir(parents=True, exist_ok=True)
@@ -15523,6 +17001,8 @@ def blackbox(native, folder, agent, mode, stop_vk):
         'offline_static_and_synthetic_not_game_verified': True,
         'actual_game_success_rate': None,
         'actual_game_input_receipt_verified': None,
+        'visual_input_causality_is_proxy': True,
+        'visual_effect_confirmation_definition': 'screen-change and controlled-effect evidence only; not game input receipt',
         'world_prediction_error_variance': brain.game.prediction_error_variance if brain else None,
         'world_scene_holdout_samples': sum(max(0, int(record[0])) for record in brain.game.world_holdout_groups.values()) if brain else 0,
         'world_scene_holdout_mean_error': (round(sum(int(record[0]) * float(record[1]) for record in brain.game.world_holdout_groups.values()) /
@@ -15548,6 +17028,8 @@ def blackbox(native, folder, agent, mode, stop_vk):
         'dual_objective_head_population': sum(value > 0 for value in brain.game.objective_head_samples) if brain else 0,
         'dual_control_head_samples': sum(brain.game.control_head_samples) if brain else 0,
         'dual_objective_head_samples': sum(brain.game.objective_head_samples) if brain else 0,
+        'information_value_head_population': sum(value > 0 for value in brain.game.information_head_samples) if brain else 0,
+        'information_value_head_samples': sum(brain.game.information_head_samples) if brain else 0,
         'world_event_contexts': len(brain.game.world_events) if brain else 0,
         'transfer_skill_tests': len(brain.game.transfer_skill_stats) if brain else 0,
         'latest_evidence_confidence': {field: brain.reward_info.get(field) for field in ('action_evidence_confidence', 'objective_evidence_confidence', 'reward_learning_confidence')} if brain else {},
@@ -15576,12 +17058,22 @@ def blackbox(native, folder, agent, mode, stop_vk):
         'bound_target_pid': agent.capture_target_pid if agent else None,
         'bound_target_hwnd': agent.capture_target_hwnd if agent else None,
         'actions_cut_short_by_visual_feedback': agent.monitor_breaks if agent else 0,
+        'actions_cut_short_by_local_visual_feedback': agent.monitor_local_breaks if agent else 0,
+        'camera_motion_action_interruptions_suppressed': agent.monitor_camera_suppressed if agent else 0,
+        'screen_correlated_control_responses': brain.game.diagnostics['screen_correlated_control_responses'] if brain else 0,
+        'visual_effect_confirmations': agent.visual_effect_observations if agent else 0,
+        'visual_no_effect_confirmations': agent.visual_no_effect_observations if agent else 0,
+        'visually_undetermined_inputs': agent.unverified_input_observations if agent else 0,
+        'credible_goal_progress_events': agent.credible_goal_progress_events if agent else 0,
         'touch_injection_supported': agent.controller.touch_available if agent and agent.controller else None,
+        'game_input_receipt_measurement_available': False,
         'storage_problem': brain.storage_problem if brain else None,
         'storage_failures': brain.storage_failures if brain else 0,
         'pending_keyframes': len(brain.frame_backlog) if brain else 0,
         'skipped_keyframes': brain.keyframes_skipped if brain else 0,
         'capture_backend': agent.capture.backend if agent and agent.capture else None,
+        'capture_backend_switches': agent.capture.backend_switches if agent and agent.capture else 0,
+        'capture_fast_backend_failures': agent.capture.fast_backend_failures if agent and agent.capture else 0,
         'stop_input_channels': agent.listener.mode if agent and agent.listener else None,
         'stop_raw_events': agent.listener.raw_events if agent and agent.listener else 0,
         'stop_hook_events': agent.listener.hook_events if agent and agent.listener else 0,
@@ -15595,8 +17087,16 @@ def blackbox(native, folder, agent, mode, stop_vk):
         'win_verified': None,
         'model_excerpt_note': '若完整检查点超过容量上限，保存活动游戏的自建模型 FP16 诊断摘录；该摘录不是完整训练状态，不能直接替代检查点。',
     }
-    events = list(agent.events) if agent else []
+    database_events, database_screen, database_statistics, database_error = read_blackbox_history(folder)
+    events = list(agent.events) if agent else database_events
     errors = list(agent.errors) if agent else []
+    last_screen = brain.last_frame if brain is not None else database_screen
+    manifest['experience_database_snapshot'] = database_statistics
+    manifest['experience_database_snapshot_error'] = database_error
+    manifest['events_from_persisted_transitions'] = agent is None and bool(database_events)
+    if agent is None and database_statistics:
+        manifest['transitions_in_database'] = database_statistics['persisted_transitions']
+        manifest['tracked_screens'] = database_statistics['persisted_keyframes']
     state = folder / 'learning_state.json.gz'
     delta_state = folder / 'learning_delta.json.gz'
     checkpoint = inspect_checkpoint_bundle(folder)
@@ -15608,6 +17108,16 @@ def blackbox(native, folder, agent, mode, stop_vk):
     performance = folder / 'runtime_profile.json'
     supervisor = folder / 'supervisor_state.json'
     error_file = folder / 'agent_errors.jsonl'
+    worker_error_file = folder / 'worker_stderr.log'
+    heartbeat_file = folder / 'worker_heartbeat.json'
+    heartbeat_data = None
+    try:
+        if heartbeat_file.stat().st_size <= 4096:
+            value = json.loads(heartbeat_file.read_text(encoding='utf-8'))
+            if isinstance(value, dict) and value.get('build') == SOURCE_BUILD:
+                heartbeat_data = value
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
     for source, key, limit in ((runtime, 'runtime_snapshot', 30000),
                                (supervisor, 'supervisor_snapshot', 10000)):
         try:
@@ -15618,7 +17128,10 @@ def blackbox(native, folder, agent, mode, stop_vk):
                         ('steps', 'game', 'completed_actions', 'failures', 'training_updates',
                          'valid_transitions', 'self_supervised_visual_steps', 'self_supervised_visual_error',
                          'input_events_accepted_by_windows', 'game_received_input', 'screen_outcome_totals',
-                         'first_run_checks', 'last_capture_valid', 'phase', 'last_error')
+                         'first_run_checks', 'last_capture_valid', 'phase', 'last_error',
+                         'actions_cut_short_by_local_visual_feedback', 'visual_effect_confirmations',
+                         'visual_no_effect_confirmations', 'visually_undetermined_inputs',
+                         'credible_goal_progress_events', 'input_failures', 'sensor_restarts')
                         if key == 'runtime_snapshot' else
                         ('phase', 'worker_restarts', 'worker_last_returncode', 'worker_last_error',
                          'recovered_input_snapshots', 'stop_requested'))}
@@ -15630,7 +17143,31 @@ def blackbox(native, folder, agent, mode, stop_vk):
                         manifest['valid_transitions'] = int(details.get('valid_transitions', 0))
                         manifest['game_identity'] = details.get('game')
                         manifest['total_proxy_reward'] = details.get('total_proxy_reward', 0.0)
+                        for metric in ('actions_cut_short_by_visual_feedback', 'actions_cut_short_by_local_visual_feedback',
+                                       'visual_effect_confirmations', 'visual_no_effect_confirmations',
+                                       'visually_undetermined_inputs', 'credible_goal_progress_events',
+                                       'input_failures', 'sensor_restarts'):
+                            manifest[metric] = details.get(metric)
         except (OSError, ValueError, TypeError, OverflowError, json.JSONDecodeError):
+            pass
+    persisted_learning_diagnostics = {}
+    if brain is None:
+        try:
+            if runtime.exists() and runtime.stat().st_size <= 60000:
+                latest = json.loads(runtime.read_text(encoding='utf-8'))
+                if isinstance(latest, dict):
+                    keys = ('updated', 'steps', 'game', 'valid_transitions', 'training_updates',
+                            'training_failures', 'last_reward', 'learning_evidence_diagnostics',
+                            'self_supervised_visual_steps', 'self_supervised_visual_error',
+                            'screen_outcome_totals', 'last_decision', 'storage_problem',
+                            'checkpoint_verified', 'last_capture_valid', 'last_observation_quality',
+                            'measured_pipeline_stages_milliseconds', 'action_input_attempts',
+                            'action_input_dispatches', 'game_received_input',
+                            'actions_cut_short_by_local_visual_feedback', 'visual_effect_confirmations',
+                            'visual_no_effect_confirmations', 'visually_undetermined_inputs',
+                            'credible_goal_progress_events')
+                    persisted_learning_diagnostics = {key: latest[key] for key in keys if key in latest}
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
             pass
     manifest['learning_state_bytes'] = state.stat().st_size if state.exists() else 0
     manifest['learning_delta_bytes'] = delta_state.stat().st_size if delta_state.exists() else 0
@@ -15671,8 +17208,11 @@ def blackbox(native, folder, agent, mode, stop_vk):
             'checkpoint_restores_latest': bool(include_state and checkpoint_eligible and checkpoint['restores_latest']),
             'learning_delta_included': bool(include_state and checkpoint_eligible and checkpoint['delta_valid']),
             'active_model_excerpt_included': bool(include_excerpt and excerpt is not None),
-            'screen_included': bool(include_screen and brain and brain.last_frame),
+            'screen_included': bool(include_screen and last_screen is not None),
             'error_log_included': bool(include_log and error_file.exists()),
+            'worker_stderr_included': bool(include_log and worker_error_file.exists()),
+            'worker_heartbeat_included': heartbeat_data is not None,
+            'learning_diagnostics_included': bool(brain is not None or persisted_learning_diagnostics),
             'events_included': min(len(events), event_count),
             'events_omitted': max(0, len(events) - event_count),
             'checkpoint_omission': 'invalid_or_missing' if not checkpoint_files else 'size_limit' if not checkpoint_eligible else 'size_budget' if not include_state else None,
@@ -15680,7 +17220,7 @@ def blackbox(native, folder, agent, mode, stop_vk):
                                         'invalid_or_incompatible' if not checkpoint['delta_valid'] else
                                         'size_limit' if not checkpoint_eligible else
                                         'size_budget' if not include_state else None),
-            'screen_omission': 'size_budget' if not include_screen and brain and brain.last_frame else 'not_available' if not brain or not brain.last_frame else None,
+            'screen_omission': 'size_budget' if not include_screen and last_screen is not None else 'not_available' if last_screen is None else None,
             'error_log_omission': 'size_budget' if not include_log and error_file.exists() else 'not_found' if not error_file.exists() else None,
             'error_log_tail_truncated': bool(include_log and error_file.exists() and error_file.stat().st_size > 32000),
             'runtime_state_omission': 'not_found' if not runtime.exists() else 'size_limit' if runtime.stat().st_size > 30000 else None,
@@ -15709,8 +17249,14 @@ def blackbox(native, folder, agent, mode, stop_vk):
                         boundary = lines.rfind(b'\n')
                         lines = lines[:boundary + 1] if boundary >= 0 else b''
                     archive.writestr('error_log_tail.jsonl', lines)
-            if include_screen and brain and brain.last_frame:
-                archive.writestr('last_screen.png', encode_png(brain.last_frame))
+            if include_log and worker_error_file.exists():
+                with worker_error_file.open('rb') as stream:
+                    stream.seek(max(0, worker_error_file.stat().st_size - 48000))
+                    archive.writestr('worker_stderr_tail.log', stream.read(48000))
+            if heartbeat_data is not None:
+                archive.writestr('worker_heartbeat.json', json.dumps(heartbeat_data, ensure_ascii=False, separators=(',', ':')))
+            if include_screen and last_screen is not None:
+                archive.writestr('last_screen.png', encode_png(last_screen))
             if include_state and checkpoint_eligible:
                 for checkpoint_file in checkpoint_files:
                     archive.write(checkpoint_file, checkpoint_file.name)
@@ -15739,6 +17285,8 @@ def blackbox(native, folder, agent, mode, stop_vk):
                         'game_statistics': {key: {'steps': value.game_steps, 'tracked_screens': len(value.visits), 'world_states': len(value.world), 'target_regions': len(value.targets), 'possible_events': len(value.candidate_events), 'learned_hud_trends': len(value.hud_trends), 'calibrated_goal_hypotheses': len(value.goal_hypotheses), 'world_event_contexts': len(value.world_events), 'scene_routes': len(value.scene_graph), 'scene_action_contexts': len(value.scene_action_memory), 'validated_scene_groups': len(value.world_holdout_groups), 'duration_stats': len(value.duration_stats), 'trained_parameter_heads': {kind: int(head['samples']) for kind, head in value.parameter_heads.items()}, 'paired_probe_contexts': len(value.paired_probe_evidence), 'goal_no_progress_streak': value.goal_no_progress_streak, 'spatial_stats': len(value.parameter_stats), 'learned_skills': len(value.skills), 'world_network_steps': value.world_network_steps, 'world_network_error': value.world_network_error, 'tracked_passive_scenes': len(value.passive_scenes), 'prediction_error_mean': value.prediction_error_mean, 'plan_success': value.plan_success, 'screen_outcomes': value.screen_outcomes} for key, value in list(brain.games.items())[-32:]},
                     }
                 archive.writestr('learning_diagnostics.json', json.dumps(diagnostics, ensure_ascii=False, separators=(',', ':')))
+            elif persisted_learning_diagnostics:
+                archive.writestr('learning_diagnostics.json', json.dumps(persisted_learning_diagnostics, ensure_ascii=False, separators=(',', ':')))
     try:
         for keep_state, event_count, screen, keep_log, keep_excerpt in (
                 (True, 350, True, True, True), (True, 150, False, True, True),
@@ -15762,8 +17310,8 @@ def blackbox(native, folder, agent, mode, stop_vk):
             archive.writestr('report.json', json.dumps(minimal, ensure_ascii=False, separators=(',', ':')))
             archive.writestr('recent_errors.json', json.dumps(errors[-3:], ensure_ascii=False, separators=(',', ':')))
             archive.writestr('recent_actions.json', json.dumps(events[-12:], ensure_ascii=False, separators=(',', ':')))
-            if brain is not None and brain.last_frame is not None:
-                archive.writestr('last_screen.png', encode_png(brain.last_frame))
+            if last_screen is not None:
+                archive.writestr('last_screen.png', encode_png(last_screen))
         if temp.stat().st_size <= 1_000_000:
             os.replace(temp, final)
             return final
@@ -15797,6 +17345,114 @@ def read_worker_backend(folder, backend_name):
     return None
 
 
+def enable_dpi_awareness():
+    try:
+        user = ctypes.WinDLL('user32', use_last_error=True)
+        enabled = False
+        try:
+            awareness = user.SetProcessDpiAwarenessContext
+            awareness.argtypes = [ctypes.c_void_p]
+            awareness.restype = ctypes.c_int
+            enabled = bool(awareness(ctypes.c_void_p(-4)))
+        except (AttributeError, OSError, ValueError):
+            pass
+        if not enabled:
+            try:
+                user.SetProcessDPIAware()
+            except (AttributeError, OSError):
+                pass
+    except OSError:
+        pass
+
+
+def worker_cpu_seconds(process):
+    handle = getattr(process, '_handle', None)
+    if not handle or os.name != 'nt':
+        return None
+    try:
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        call = kernel.GetProcessTimes
+        call.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulonglong), ctypes.POINTER(ctypes.c_ulonglong),
+                         ctypes.POINTER(ctypes.c_ulonglong), ctypes.POINTER(ctypes.c_ulonglong)]
+        call.restype = ctypes.c_int
+        created, exited, kernel_time, user_time = (ctypes.c_ulonglong() for _ in range(4))
+        if call(handle, ctypes.byref(created), ctypes.byref(exited), ctypes.byref(kernel_time), ctypes.byref(user_time)):
+            return (kernel_time.value + user_time.value) / 10_000_000.0
+    except (OSError, AttributeError, ValueError, TypeError):
+        pass
+    return None
+
+
+def supervisor_stall_reason(snapshot, now, born, last_heartbeat, last_input, last_sensor,
+                            last_learning, last_cpu, last_progress, cpu_available):
+    if now - born < 18.0:
+        return None
+    heartbeat_age = max(0.0, now - last_heartbeat)
+    if heartbeat_age > 18.0:
+        cpu_recent = cpu_available and now - last_cpu < 5.0
+        sensor_recent = now - last_sensor < 5.0
+        if (cpu_recent and heartbeat_age < 110.0) or (sensor_recent and heartbeat_age < 55.0):
+            return None
+        return '执行进程心跳失联，需要重建'
+    if not isinstance(snapshot, dict):
+        if now - born > 28.0:
+            return '执行进程未能建立有效心跳'
+        return None
+    phase = str(snapshot.get('phase', ''))
+    stage_age = snapshot.get('stage_progress_age')
+    sensor_age = snapshot.get('sensor_progress_age')
+    if not isinstance(stage_age, (int, float)) or not math.isfinite(stage_age):
+        return None
+    measured = snapshot.get('stage_costs')
+    durations = ([float(value) for value in measured.values()
+                  if isinstance(value, (int, float)) and math.isfinite(value) and 0.0 <= value <= 10000.0]
+                 if isinstance(measured, dict) else [])
+    slowest = max(durations, default=350.0) / 1000.0
+    limit = max(28.0, min(90.0, 24.0 + slowest * 9.0))
+    if cpu_available and now - last_cpu < 5.0 and stage_age < max(110.0, limit * 2.8):
+        return None
+    if (isinstance(sensor_age, (int, float)) and math.isfinite(sensor_age)
+            and sensor_age > max(15.0, limit * 0.55) and now - last_sensor > max(15.0, limit * 0.55)
+            and stage_age > limit and now - last_progress > limit * 0.50):
+        return '图像采集和执行阶段均停止推进'
+    if (phase in ('initializing', 'capturing', 'acting', 'learning', 'recovering')
+            and stage_age > limit and now - last_input > limit * 0.72
+            and now - last_learning > limit * 0.72):
+        return '执行主循环长时间未完成有效处理'
+    return None
+
+
+def worker_progress_snapshot(folder, session, process):
+    try:
+        path = folder / 'worker_heartbeat.json'
+        if path.stat().st_size > 4096:
+            return None
+        data = json.loads(path.read_text(encoding='utf-8'))
+        if (isinstance(data, dict) and data.get('build') == SOURCE_BUILD
+                and data.get('session') == session and data.get('pid') == process.pid
+                and isinstance(data.get('at'), (int, float))
+                and abs(time.time() - float(data['at'])) < 180):
+            return data
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    return None
+
+
+def rotate_worker_stderr(folder):
+    path = folder / 'worker_stderr.log'
+    try:
+        if path.exists() and path.stat().st_size > 262144:
+            with path.open('rb') as stream:
+                stream.seek(max(0, path.stat().st_size - 65536))
+                tail = stream.read(65536)
+            temporary = folder / 'worker_stderr.log.tmp'
+            temporary.write_bytes(tail)
+            os.replace(temporary, path)
+    except OSError:
+        pass
+    return path
+
+
 def run_agent_subprocess(configuration):
     if not isinstance(configuration, dict) or configuration.get('build') != SOURCE_BUILD:
         raise ValueError('Agent 子进程代码版本与监管进程不匹配')
@@ -15809,26 +17465,50 @@ def run_agent_subprocess(configuration):
     session = configuration.get('session')
     if not isinstance(session, str) or len(session) != 32 or any(item not in '0123456789abcdef' for item in session):
         raise ValueError('Agent 子进程运行标识无效')
+    enable_dpi_awareness()
     native = Native()
     try:
         numeric = read_worker_backend(folder, configuration.get('backend', 'pure_python'))
         agent = GameAgent(native, folder, mode, stop_vk, int(configuration['owner']), numeric)
         agent.externally_supervised = True
         stopped = agent.stop_event
-        def report_child_stop():
-            report = {'build': SOURCE_BUILD, 'session': session, 'pid': os.getpid(),
-                      'event': 'STOP', 'at': time.time()}
-            destination = folder / 'child_stop_signal.json'
-            temporary = folder / ('child_stop_signal_' + session + '.tmp')
-            try:
-                with temporary.open('w', encoding='utf-8') as stream:
-                    json.dump(report, stream, ensure_ascii=False, separators=(',', ':'))
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                os.replace(temporary, destination)
-            except OSError:
-                pass
-        agent.stop_gate.on_stop = report_child_stop
+        agent.stop_gate.allow_local_press = False
+        heartbeat_exit = threading.Event()
+        def publish_heartbeat():
+            path = folder / 'worker_heartbeat.json'
+            temporary = folder / ('worker_heartbeat_' + session + '.tmp')
+            while not heartbeat_exit.is_set() and not stopped.is_set():
+                now = time.monotonic()
+                controller = agent.controller
+                state = {'build': SOURCE_BUILD, 'session': session, 'pid': os.getpid(), 'at': time.time(),
+                         'phase': agent.phase, 'steps': agent.brain.step if agent.brain is not None else 0,
+                         'sensor_frames': agent.sensor_frames_total, 'completed_actions': agent.completed_actions,
+                         'partial_actions': agent.partial_actions, 'feedback_captures': agent.feedback_captures,
+                         'input_attempts': controller.attempted_action_inputs if controller is not None else 0,
+                         'input_dispatches': controller.successful_action_inputs if controller is not None else 0,
+                         'input_failures': controller.failed_inputs if controller is not None else 0,
+                         'last_input_progress_age': max(0.0, now - controller.last_action_input_at)
+                         if controller is not None and controller.last_action_input_at is not None else None,
+                         'training_updates': agent.brain.updates if agent.brain is not None else 0,
+                         'training_heartbeat_age': max(0.0, now - agent.brain.training_last_tick)
+                         if agent.brain is not None else None,
+                         'stage_progress_age': max(0.0, now - agent.last_stage_progress),
+                         'sensor_progress_age': max(0.0, now - agent.sensor_last_success)
+                         if agent.sensor_last_success is not None else None,
+                         'sensor_attempt_age': max(0.0, now - agent.sensor_last_attempt)
+                         if agent.sensor_last_attempt is not None else None,
+                         'stage_costs': {key: row[0] for key, row in agent.stage_costs.items()}}
+                try:
+                    with temporary.open('w', encoding='utf-8') as stream:
+                        json.dump(state, stream, ensure_ascii=False, separators=(',', ':'), allow_nan=False)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    os.replace(temporary, path)
+                except OSError:
+                    pass
+                heartbeat_exit.wait(2.0)
+        heart = threading.Thread(target=publish_heartbeat, name='AgentExecutionHeartbeat', daemon=True)
+        heart.start()
         def receive_stop():
             try:
                 descriptor = sys.stdin.fileno()
@@ -15860,7 +17540,7 @@ def run_agent_subprocess(configuration):
                     agent.externally_supervised = True
                     agent.stop_event = stopped
                     agent.stop_gate.stop_event = stopped
-                    agent.stop_gate.on_stop = report_child_stop
+                    agent.stop_gate.allow_local_press = False
                     agent.started = previous.started
                     break
                 except BaseException as exc:
@@ -15869,6 +17549,10 @@ def run_agent_subprocess(configuration):
                 raise RuntimeError('无法恢复 Agent 核心，交由监管进程重建')
         return 0
     finally:
+        if 'heartbeat_exit' in locals():
+            heartbeat_exit.set()
+        if 'heart' in locals() and heart.is_alive():
+            heart.join(timeout=2.5)
         if native.com_initialized:
             native.ole.CoUninitialize()
 
@@ -15913,7 +17597,6 @@ class App:
         self.preparing = False
         self.ready = False
         self.running = False
-        self.agent = None
         self.message = '请选择数据文件夹。'
         self.options = stop_options()
         self.controls = {}
@@ -15983,8 +17666,7 @@ class App:
             self.folder = lease.folder / AGENT_DATA_DIR
             if previous is not None:
                 previous.close()
-            self.agent = None
-            self.numpy = None
+                self.numpy = None
             self.runtime_profile = None
         self.n.user.SetWindowTextW(self.controls[102], str(self.folder))
         self.start_prepare()
@@ -16038,7 +17720,7 @@ class App:
                     window_probe.close()
             self.set_status('正在测量离线视觉处理与动作决策速度')
             try:
-                self.runtime_profile = profile_runtime(self.folder, self.numpy, capture_ms, stop_vk)
+                self.runtime_profile = profile_runtime(self.folder, self.numpy, capture_ms, stop_vk, (frame, rect))
             except Exception:
                 fallback = None
                 if self.numpy is not None:
@@ -16049,7 +17731,7 @@ class App:
                     except Exception:
                         pass
                 self.numpy = fallback
-                self.runtime_profile = profile_runtime(self.folder, self.numpy, capture_ms, stop_vk)
+                self.runtime_profile = profile_runtime(self.folder, self.numpy, capture_ms, stop_vk, (frame, rect))
             self.set_status('正在验证停止键监听初始化')
             probe_listener = StopListener(self.n, stop_vk, threading.Event())
             try:
@@ -16070,7 +17752,7 @@ class App:
                     raise sqlite3.DatabaseError('经验库回读验证失败')
             finally:
                 store.close()
-            self.set_status('正在禁用网络测试离线重启、训练、经验持久化及恢复')
+            self.set_status('正在验证禁用网络后的本地冷启动、训练与数据持久化')
             verify_offline_cold_start(self.folder, self.numpy, stop_vk, mode)
             self.runtime_profile['offline_network_blocked_preflight_passed'] = True
             self.runtime_profile['physical_airplane_mode_tested'] = False
@@ -16082,7 +17764,7 @@ class App:
                 os.fsync(stream.fileno())
             os.replace(temporary, profile)
             estimated = self.runtime_profile['estimated_single_decision_milliseconds']
-            self.set_status(f'一切就绪 · 本地离线运行 · 基准决策约 {estimated:.1f} 毫秒（不含采集、训练及游戏延迟）')
+            self.set_status(f'一切就绪 · 已通过网络屏蔽离线预检 · 基准决策约 {estimated:.1f} 毫秒（未验证真实飞行模式）')
             self.prepared_config = configuration
             self.ready = True
         except BaseException as exc:
@@ -16100,6 +17782,9 @@ class App:
             if (mode, stop_vk) != self.prepared_config:
                 self.start_prepare()
                 return
+            self.process_mode, self.process_stop_vk = mode, stop_vk
+            if not self.restore_orphaned_inputs():
+                raise OSError('检测到此前未释放的输入，自动恢复未成功')
             stop_event = threading.Event()
             gate = StopKeyGate(self.n, stop_vk, stop_event)
             gate.on_stop = lambda: self.n.user.PostMessageW(self.hwnd, WM_APP_STOP_REQUESTED, 0, 0)
@@ -16116,7 +17801,6 @@ class App:
             self.worker_last_returncode = None
             self.worker_last_error = None
             self.worker_input_recoveries = 0
-            self.process_mode, self.process_stop_vk = mode, stop_vk
             self.process_session = uuid.uuid4().hex
             self.running = True
             self.write_supervisor_state('starting')
@@ -16132,6 +17816,10 @@ class App:
                 listener.close()
             if guardian is not None:
                 guardian.close()
+            if self.pending_release_controller is not None and not self.release_repair_active:
+                self.release_repair_active = True
+                threading.Thread(target=self.repair_release,
+                                 args=(self.pending_release_controller,), name='InputRelease', daemon=True).start()
             self.n.user.ShowWindow(self.hwnd, 5)
             self.set_status(f'启动失败：{str(exc)[:150]}')
 
@@ -16174,9 +17862,9 @@ class App:
             state = json.loads(ledger.read_text(encoding='utf-8'))
             if not isinstance(state, dict) or state.get('build') != SOURCE_BUILD:
                 return True
-            stop_vk = getattr(self, 'process_stop_vk', self.chosen_stop_key())
-            if state.get('stop_vk') != stop_vk:
-                return True
+            stop_vk = getattr(self, 'process_stop_vk', None)
+            if stop_vk is None:
+                stop_vk = self.chosen_stop_key()
             control = Controller(self.n, stop_vk, threading.Event())
             control.ledger_path = ledger
             control.down = {int(code) for code in state.get('keys', [])
@@ -16193,6 +17881,7 @@ class App:
                 self.worker_input_recoveries += 1
                 self.write_supervisor_state('releasing_inputs')
             control.release(retries=6)
+            self.pending_release_controller = None
             return True
         except BaseException as exc:
             self.record_supervisor_failure(exc)
@@ -16200,26 +17889,14 @@ class App:
                 self.pending_release_controller = control
             return False
 
-    def check_worker_stop_signal(self, worker):
-        try:
-            data = json.loads((self.folder / 'child_stop_signal.json').read_text(encoding='utf-8'))
-            if (isinstance(data, dict) and data.get('build') == SOURCE_BUILD
-                    and data.get('session') == self.process_session
-                    and data.get('pid') == worker.pid and data.get('event') == 'STOP'):
-                if not self.stop_event.is_set():
-                    self.stop_event.set()
-                    self.n.user.PostMessageW(self.hwnd, WM_APP_STOP_REQUESTED, 0, 0)
-                return True
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            pass
-        return False
-
     def agent_worker(self):
         current_process = None
         stop_requested_at = None
         try:
             while self.stop_event is not None and not self.stop_event.is_set():
                 try:
+                    if not self.restore_orphaned_inputs():
+                        raise OSError('无法确认遗留输入已经释放')
                     backend = getattr(self.numpy, '__name__', 'pure_python') if self.numpy is not None else 'pure_python'
                     configuration = {'build': SOURCE_BUILD, 'folder': str(self.folder),
                                      'mode': self.process_mode, 'stop_vk': self.process_stop_vk,
@@ -16227,17 +17904,27 @@ class App:
                                      'session': self.process_session}
                     command = [sys.executable, '-I', str(pathlib.Path(__file__).resolve()),
                                '--internal-agent-worker', json.dumps(configuration, ensure_ascii=False, separators=(',', ':'))]
-                    current_process = subprocess.Popen(command, stdin=subprocess.PIPE,
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                        bufsize=0, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+                    log_path = rotate_worker_stderr(self.folder)
+                    with log_path.open('ab', buffering=0) as error_stream:
+                        current_process = subprocess.Popen(command, stdin=subprocess.PIPE,
+                            stdout=subprocess.DEVNULL, stderr=error_stream,
+                            bufsize=0, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
                     self.worker_process = current_process
                     self.write_supervisor_state('running')
-                    birth = time.time()
-                    last_heartbeat = time.monotonic()
-                    previous_mtime = 0.0
+                    born = time.monotonic()
+                    last_heartbeat = born
+                    last_progress = born
+                    last_cpu_progress = born
+                    last_cpu = worker_cpu_seconds(current_process)
+                    previous_signature = None
+                    previous_sensor_frames = None
+                    previous_actions = None
+                    previous_learning = None
+                    last_sensor_progress = born
+                    last_input_progress = born
+                    last_learning_progress = born
                     stop_requested_at = None
                     while current_process.poll() is None:
-                        self.check_worker_stop_signal(current_process)
                         if self.stop_event.is_set():
                             if stop_requested_at is None:
                                 stop_requested_at = time.monotonic()
@@ -16266,19 +17953,39 @@ class App:
                                 self.stop_guardian.start()
                             except BaseException as exc:
                                 self.record_supervisor_failure(exc)
-                        try:
-                            status_file = self.folder / 'runtime_state.json'
-                            timestamp = status_file.stat().st_mtime if status_file.exists() else 0.0
-                            if timestamp > max(previous_mtime, birth - 1.0):
-                                previous_mtime = timestamp
-                                last_heartbeat = time.monotonic()
-                        except OSError:
-                            pass
-                        if time.monotonic() - last_heartbeat >= 90.0:
-                            self.record_supervisor_failure(TimeoutError('执行核心 90 秒未刷新状态，进程级恢复'))
+                        now = time.monotonic()
+                        snapshot = worker_progress_snapshot(self.folder, self.process_session, current_process)
+                        if snapshot is not None:
+                            last_heartbeat = now
+                            sensor_frames = snapshot.get('sensor_frames')
+                            action_signature = (snapshot.get('input_dispatches'), snapshot.get('completed_actions'),
+                                                snapshot.get('partial_actions'), snapshot.get('feedback_captures'))
+                            learning_signature = (snapshot.get('steps'), snapshot.get('training_updates'))
+                            if sensor_frames != previous_sensor_frames:
+                                previous_sensor_frames = sensor_frames
+                                last_sensor_progress = now
+                            if action_signature != previous_actions:
+                                previous_actions = action_signature
+                                last_input_progress = now
+                            if learning_signature != previous_learning:
+                                previous_learning = learning_signature
+                                last_learning_progress = now
+                            signature = (sensor_frames, action_signature, learning_signature, snapshot.get('phase'))
+                            if signature != previous_signature:
+                                previous_signature = signature
+                                last_progress = now
+                        cpu = worker_cpu_seconds(current_process)
+                        if cpu is not None:
+                            if last_cpu is None or cpu > last_cpu + 0.08:
+                                last_cpu_progress = now
+                            last_cpu = cpu
+                        failure = supervisor_stall_reason(snapshot, now, born, last_heartbeat,
+                            last_input_progress, last_sensor_progress, last_learning_progress,
+                            last_cpu_progress, last_progress, cpu is not None)
+                        if failure:
+                            self.record_supervisor_failure(TimeoutError(f'{failure}，监管进程正在恢复执行'))
                             current_process.terminate()
                         self.stop_event.wait(0.15)
-                    self.check_worker_stop_signal(current_process)
                     self.worker_last_returncode = current_process.returncode
                     if current_process.stdin is not None:
                         current_process.stdin.close()
@@ -16319,7 +18026,13 @@ class App:
             if self.stop_guardian is not None:
                 self.stop_guardian.close()
                 self.stop_guardian = None
-            self.n.user.PostMessageW(self.hwnd, WM_APP_STOPPED, 0, 0)
+            if self.stop_event is not None and self.stop_event.is_set():
+                self.n.user.PostMessageW(self.hwnd, WM_APP_STOPPED, 0, 0)
+            else:
+                self.worker_restarts += 1
+                self.record_supervisor_failure(RuntimeError('监管线程意外退出，恢复自动监督'))
+                self.worker = threading.Thread(target=self.agent_worker, name='AgentSupervisor', daemon=False)
+                self.worker.start()
 
     def repair_release(self, control):
         attempts = 0
@@ -16329,14 +18042,11 @@ class App:
                 try:
                     control.release(retries=5)
                     if not (control.down or control.mouse_down or control.touch_points):
-                        if self.agent is not None:
-                            self.agent.input_release_verified = True
                         self.pending_release_controller = None
                         self.n.user.PostMessageW(self.hwnd, WM_APP_RELEASED, 0, 0)
                         return
                 except Exception as exc:
-                    if self.agent is not None:
-                        self.agent.error(exc)
+                    self.record_supervisor_failure(exc)
                 time.sleep(min(2.0, 0.18 + attempts * 0.06))
         finally:
             self.release_repair_active = False
@@ -16351,13 +18061,13 @@ class App:
         self.n.user.EnableWindow(self.controls[201], 0)
         self.set_status('正在创建黑匣子压缩包…')
         threading.Thread(target=self.export_blackbox_worker,
-                         args=(self.folder, self.agent, self.chosen_mode(), self.chosen_stop_key()),
+                         args=(self.folder, self.chosen_mode(), self.chosen_stop_key()),
                          name='Blackbox', daemon=True).start()
 
-    def export_blackbox_worker(self, folder, agent, mode, stop_vk):
+    def export_blackbox_worker(self, folder, mode, stop_vk):
         com_ready = self.n.ole.CoInitializeEx(None, 2) in (0, 1)
         try:
-            path = blackbox(self.n, folder, agent, mode, stop_vk)
+            path = blackbox(self.n, folder, None, mode, stop_vk)
             self.set_status(f'黑匣子已保存到桌面：{path.name}（{path.stat().st_size} 字节）')
         except BaseException as exc:
             self.set_status(f'黑匣子创建失败：{str(exc)[:170]}')
@@ -16415,6 +18125,11 @@ class App:
                     self.n.user.PostMessageW(self.hwnd, WM_APP_READY, 0, 0)
                 return 0
             if msg == WM_APP_STOPPED:
+                if self.stop_event is None or not self.stop_event.is_set():
+                    if self.running and (self.worker is None or not self.worker.is_alive()):
+                        self.worker = threading.Thread(target=self.agent_worker, name='AgentSupervisor', daemon=False)
+                        self.worker.start()
+                    return 0
                 self.running = False
                 self.n.user.ShowWindow(self.hwnd, 5)
                 self.n.user.UpdateWindow(self.hwnd)
@@ -16442,16 +18157,12 @@ class App:
                 return 0
         except BaseException as exc:
             try:
-                agent = getattr(self, 'agent', None)
-                if agent is not None:
-                    agent.error(exc)
-                else:
-                    folder = getattr(self, 'folder', None)
-                    if folder is not None:
-                        entry = {'at': time.time(), 'type': type(exc).__name__, 'error': str(exc)[:350],
-                                 'phase': 'window_proc', 'message': int(msg), 'trace': traceback.format_exc(limit=8)[-2400:]}
-                        with (folder / 'agent_errors.jsonl').open('a', encoding='utf-8') as stream:
-                            stream.write(json.dumps(entry, ensure_ascii=False) + '\n')
+                folder = getattr(self, 'folder', None)
+                if folder is not None:
+                    entry = {'at': time.time(), 'type': type(exc).__name__, 'error': str(exc)[:350],
+                             'phase': 'window_proc', 'message': int(msg), 'trace': traceback.format_exc(limit=8)[-2400:]}
+                    with (folder / 'agent_errors.jsonl').open('a', encoding='utf-8') as stream:
+                        stream.write(json.dumps(entry, ensure_ascii=False) + '\n')
             except Exception:
                 pass
             return self.n.user.DefWindowProcW(hwnd, msg, wp, lp)
@@ -16480,6 +18191,7 @@ def main():
         ctypes.WinDLL('kernel32').FreeConsole()
     except Exception:
         pass
+    enable_dpi_awareness()
     App().loop()
 
 
