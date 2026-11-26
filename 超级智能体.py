@@ -90,6 +90,13 @@ def available_physical_memory_bytes():
         return None
 
 
+def available_disk_bytes(folder):
+    try:
+        return max(0, int(shutil.disk_usage(pathlib.Path(folder)).free))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+
+
 def storage_resource_snapshot(folder):
     path = pathlib.Path(folder)
     try:
@@ -100,25 +107,18 @@ def storage_resource_snapshot(folder):
         total = None
         free = None
     persistent = 0
-    pending = [path]
-    while pending:
-        current = pending.pop()
-        try:
-            with os.scandir(current) as entries:
-                for entry in entries:
-                    try:
-                        if entry.is_symlink():
-                            continue
-                        if entry.is_file(follow_symlinks=False):
-                            persistent += int(entry.stat(follow_symlinks=False).st_size)
-                        elif entry.is_dir(follow_symlinks=False):
-                            pending.append(pathlib.Path(entry.path))
-                    except OSError:
-                        continue
-        except OSError:
-            continue
+    try:
+        with os.scandir(path) as entries:
+            for entry in entries:
+                try:
+                    if not entry.is_symlink() and entry.is_file(follow_symlinks=False):
+                        persistent += int(entry.stat(follow_symlinks=False).st_size)
+                except OSError:
+                    continue
+    except OSError:
+        pass
     fraction = free / total if free is not None and total is not None and total > 0 else None
-    factor = max(0.0, min(1.0, fraction)) if fraction is not None else 0.0
+    factor = max(0.0, min(1.0, fraction)) if fraction is not None else None
     return {'disk_total_bytes': total, 'disk_free_bytes': free,
             'persistent_data_bytes': persistent,
             'disk_free_fraction': fraction,
@@ -260,6 +260,22 @@ def feedback_time_reference(game):
     middle = len(values) // 2
     median = values[middle] if len(values) % 2 else (values[middle - 1] + values[middle]) * 0.5
     return max(0.01, median)
+
+
+def adaptive_action_tempo(feedback_delay, feedback_reference=None):
+    try:
+        delay = float(feedback_delay)
+    except (TypeError, ValueError, OverflowError):
+        delay = 0.035
+    if not math.isfinite(delay) or delay <= 0.0:
+        delay = 0.035
+    try:
+        reference = float(feedback_reference) if feedback_reference is not None else delay
+    except (TypeError, ValueError, OverflowError):
+        reference = delay
+    if not math.isfinite(reference) or reference <= 0.0:
+        reference = delay
+    return max(0.42, min(1.30, reference / max(0.035, delay)))
 
 
 def supported_goal_training(transition):
@@ -876,8 +892,10 @@ def stop_equivalent(a, b):
     if a == b:
         return True
     for generic, left, right in ((16, 160, 161), (17, 162, 163), (18, 164, 165)):
-        if b in (generic, left, right):
+        if b == generic:
             return a in (generic, left, right)
+        if a == generic and b in (left, right):
+            return True
     return False
 
 
@@ -915,6 +933,20 @@ def action_feedback_is_valid(old_rect, new_rect, feedback, tracking_available, u
     return bool(tracking_available and not user_interference and old_rect == new_rect
                 and isinstance(feedback, dict) and feedback.get('frame_deltas')
                 and feedback.get('post_action_frame_verified'))
+
+
+def physical_mouse_preserve_state(physical_mouse):
+    preserved = set()
+    mapping = {'left': MOUSEEVENTF_LEFTDOWN, 'right': MOUSEEVENTF_RIGHTDOWN,
+               'middle': MOUSEEVENTF_MIDDLEDOWN}
+    for button in physical_mouse:
+        if button in mapping:
+            preserved.add(mapping[button])
+        elif button == 'x1':
+            preserved.add(('x', 1))
+        elif button == 'x2':
+            preserved.add(('x', 2))
+    return preserved
 
 
 def normalize_input_ledger(state, stop_vk):
@@ -1266,9 +1298,9 @@ class StopListener:
         self.thread.start()
         self.poll_ready.wait(2.0)
         self.ready.wait(2.0)
-        if not self.healthy():
+        if not self.event_healthy():
             self.close()
-            raise OSError('停止键事件监听与独立轮询均未通过健康检查')
+            raise OSError('停止键事件驱动监听不可用；仅轮询无法满足可靠停止要求')
 
     def alive(self):
         return self.thread.is_alive() or self.poll_thread.is_alive()
@@ -1303,7 +1335,7 @@ class StopListener:
                 and time.monotonic() - self.last_poll_tick < 1.5 and not self.ending.is_set())
 
     def healthy(self):
-        return self.event_healthy() or self.poll_healthy()
+        return self.event_healthy()
 
     def poll_loop(self):
         while not self.ending.is_set() and not self.stop_event.is_set():
@@ -1737,7 +1769,7 @@ class NativeDXGI:
         resource = HWND()
         status = self.invoke(self.duplication, 8, ctypes.c_long, ctypes.c_uint, ctypes.POINTER(DXGIFrameInfo), ctypes.POINTER(HWND))(self.duplication, 24, ctypes.byref(info), ctypes.byref(resource))
         if status == ctypes.c_long(0x887a0027).value:
-            return self.buffer is not None
+            return False
         if status < 0:
             self._reset()
             raise OSError(f'DXGI 获取屏幕帧失败：0x{status & 0xffffffff:08x}')
@@ -2224,12 +2256,13 @@ class Capture:
         self.target_candidate_frame = None
         self.target_candidate_motion = 0.0
 
+    def has_bound_target(self):
+        return bool(self.target and self.n.user.IsWindow(self.target) and self._same_target(self.target))
+
     def is_target_focused(self):
         if self.mode != '窗口':
             return True
-        return bool(self.target and self.n.user.IsWindow(self.target)
-                    and not self.n.user.IsIconic(self.target)
-                    and self._same_target(self.target)
+        return bool(self.has_bound_target() and not self.n.user.IsIconic(self.target)
                     and self.n.user.GetForegroundWindow() == self.target)
 
     def ensure_target_focus(self):
@@ -2869,7 +2902,8 @@ class Controller:
         jitter = (0.012 if stagnation < 12 else 0.025) * (1.0 - certainty * 0.98)
         return max(0.0, min(1.0, u + random.uniform(-jitter, jitter))), max(0.0, min(1.0, v + random.uniform(-jitter, jitter)))
 
-    def execute(self, action, observation, rect, stagnation, parameters=None, monitor=None, feedback_delay=0.09):
+    def execute(self, action, observation, rect, stagnation, parameters=None, monitor=None,
+                feedback_delay=0.09, feedback_reference=None):
         if self.stopped.is_set():
             return False
         kind, a, b, x, y = action.kind, action.a, action.b, action.x, action.y
@@ -2895,7 +2929,7 @@ class Controller:
         extent = max(0.5, min(1.5, float(parameters[3]))) if parameters is not None and len(parameters) > 3 else 1.0
         certainty = max(0.0, min(1.0, float(parameters[4]))) if parameters is not None and len(parameters) > 4 and math.isfinite(float(parameters[4])) else 0.0
         planned_coordinates = bool(parameters is not None and len(parameters) > 5 and parameters[5] == 'world_plan')
-        tempo = max(0.42, min(1.30, 0.11 / max(0.035, feedback_delay)))
+        tempo = adaptive_action_tempo(feedback_delay, feedback_reference)
         if kind not in ('hold', 'pair_hold', 'move_fire', 'combat', 'aim', 'look', 'key', 'chord', 'compose', 'swipe', 'right_swipe', 'touch_swipe'):
             tempo = 1.0
         activity = max(0.55, 1.0 - min(0.40, observation.change * 0.75))
@@ -3612,15 +3646,15 @@ class ReplayStore:
             return False
         compressed = zlib.compress(obs.raw, 4)
         uid = str(getattr(obs, 'frame_uid', '')) or hashlib.sha256(compressed + str(game).encode() + str(step).encode() + str(action).encode()).hexdigest()
-        capacity = storage_resource_snapshot(self.folder).get('storage_capacity_factor', 0.0)
-        try:
-            capacity = max(0.0, min(1.0, float(capacity)))
-        except (TypeError, ValueError, OverflowError):
-            capacity = 0.0
-        capacity_roll = int(hashlib.sha256(uid.encode('utf-8', 'replace')).hexdigest()[:16], 16) / float(1 << 64)
-        if capacity_roll >= capacity:
-            self.capacity_frames_skipped += 1
-            return False
+        free_bytes = available_disk_bytes(self.folder)
+        if free_bytes is not None:
+            try:
+                page_size = max(0, int(self.db.execute('PRAGMA page_size').fetchone()[0]))
+            except (sqlite3.Error, TypeError, ValueError, IndexError):
+                page_size = 0
+            if free_bytes <= len(compressed) + page_size:
+                self.capacity_frames_skipped += 1
+                return False
         result = self.db.execute('INSERT INTO keyframes(at,game,step,action,signature,valid,width,height,frame,uid) VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(uid) DO NOTHING', (time.time(), canonical_game_key(game), int(step), action, obs.signature, int(obs.valid), W, H, sqlite3.Binary(compressed), uid))
         self.frame_step[game] = step
         if result.rowcount:
@@ -4713,6 +4747,7 @@ class Brain:
             + 2 * FEATURE_COUNT * sys.getsizeof(0.0))
         self.vision_cost_ema = 0.0
         self.training_cost_ema = 0.0
+        self.training_priority_applied = None
         self.capture_wait_ema = 0.0
         self.decision_cost_ema = 0.0
         self.training_retried = 0
@@ -11928,12 +11963,20 @@ class Brain:
         with self.storage_metrics_lock:
             previous = self.storage_metrics
             elapsed = max(0.0, now - self.storage_metrics_last_sample)
-            prior_bytes = int(previous.get('persistent_data_bytes') or 0)
-            current_bytes = int(current.get('persistent_data_bytes') or 0)
+            prior_bytes = previous.get('persistent_data_bytes')
+            current_bytes = current.get('persistent_data_bytes')
+            prior_free = previous.get('disk_free_bytes')
+            current_free = current.get('disk_free_bytes')
+            growth_samples = []
             if elapsed > 0.0:
-                observed_growth = max(0.0, (current_bytes - prior_bytes) / elapsed)
-                self.storage_growth_bytes_per_second = (observed_growth if self.storage_growth_bytes_per_second <= 0.0
-                    else 0.82 * self.storage_growth_bytes_per_second + 0.18 * observed_growth)
+                if isinstance(prior_bytes, (int, float)) and isinstance(current_bytes, (int, float)):
+                    growth_samples.append(max(0.0, (float(current_bytes) - float(prior_bytes)) / elapsed))
+                if isinstance(prior_free, (int, float)) and isinstance(current_free, (int, float)):
+                    growth_samples.append(max(0.0, (float(prior_free) - float(current_free)) / elapsed))
+                if growth_samples:
+                    observed_growth = max(growth_samples)
+                    self.storage_growth_bytes_per_second = (observed_growth if self.storage_growth_bytes_per_second <= 0.0
+                        else 0.82 * self.storage_growth_bytes_per_second + 0.18 * observed_growth)
             free = current.get('disk_free_bytes')
             growth = self.storage_growth_bytes_per_second
             current['storage_growth_bytes_per_second'] = growth
@@ -12806,7 +12849,7 @@ class Brain:
 
     def training_loop(self):
         if self.background_training:
-            set_current_thread_priority(-2)
+            self.training_priority_applied = set_current_thread_priority(-2)
         while not self.training_stop.is_set():
             self.training_last_tick = time.monotonic()
             fresh = []
@@ -12814,8 +12857,11 @@ class Brain:
                 if self.background_training and self.training_cost_ema > 0.0:
                     load = system_cpu_load()
                     metrics = self.storage_metrics_snapshot()
-                    capacity_factor = max(0.0, min(1.0, float(metrics.get('storage_capacity_factor', 0.0))))
-                    disk_scarcity = (1.0 - capacity_factor) / max(capacity_factor, 1e-9)
+                    capacity_value = metrics.get('storage_capacity_factor')
+                    capacity_factor = (max(0.0, min(1.0, float(capacity_value)))
+                                       if isinstance(capacity_value, (int, float)) and math.isfinite(float(capacity_value)) else None)
+                    disk_scarcity = ((1.0 - capacity_factor) / max(capacity_factor, 1e-9)
+                                     if capacity_factor is not None else 0.0)
                     available_memory = available_physical_memory_bytes()
                     estimated_memory = self.estimated_transition_bytes * (len(self.memory) + len(self.training_queue))
                     memory_pressure = (estimated_memory / (estimated_memory + available_memory)
@@ -12847,8 +12893,11 @@ class Brain:
                         capacity = 24 if backlog > 24 else 8
                         replay_count = 12
                     metrics = self.storage_metrics_snapshot()
-                    capacity_factor = max(0.0, min(1.0, float(metrics.get('storage_capacity_factor', 0.0))))
-                    disk_scarcity = (1.0 - capacity_factor) / max(capacity_factor, 1e-9)
+                    capacity_value = metrics.get('storage_capacity_factor')
+                    capacity_factor = (max(0.0, min(1.0, float(capacity_value)))
+                                       if isinstance(capacity_value, (int, float)) and math.isfinite(float(capacity_value)) else None)
+                    disk_scarcity = ((1.0 - capacity_factor) / max(capacity_factor, 1e-9)
+                                     if capacity_factor is not None else 0.0)
                     available_memory = available_physical_memory_bytes()
                     estimated_memory = self.estimated_transition_bytes * (len(self.memory) + len(self.training_queue))
                     memory_pressure = (estimated_memory / (estimated_memory + available_memory)
@@ -13721,6 +13770,7 @@ class GameAgent:
         self.action_physical_input_generation = 0
         self.action_user_interference = False
         self.physical_input_overflow = False
+        self.physical_input_overflow_pending = False
         self.physical_input_tracking_available = False
         self.physical_interference_actions = 0
         self.input_dispatch_tracker = InputDispatchTracker()
@@ -13751,7 +13801,7 @@ class GameAgent:
         self.focus_recovery_active = False
         self.listener = None
         self.guardian = StopGuardian(stop_vk, self.stop_gate, self.stop_event,
-                                     consume_stop_key=self.operation != 'cultivate')
+                                     consume_stop_key=True)
         self.controller = None
         self.started = time.time()
         self.failure_count = 0
@@ -13902,6 +13952,8 @@ class GameAgent:
                 'training_worker_heartbeat_age': round(time.monotonic() - self.brain.training_last_tick, 3) if self.brain is not None else None,
                 'training_batch_cost_seconds': round(self.brain.training_cost_ema, 6) if self.brain is not None else None,
                 'background_training': bool(self.brain.background_training) if self.brain is not None else False,
+                'background_process_priority_applied': getattr(self, 'background_priority_applied', None),
+                'training_thread_priority_applied': self.brain.training_priority_applied if self.brain is not None else None,
                 'storage_batch_cost_seconds': round(self.brain.storage_cost_ema, 6) if self.brain is not None else None,
                 'storage_worker_heartbeat_age': round(time.monotonic() - self.brain.storage_last_tick, 3) if self.brain is not None else None,
                 'numeric_backend': 'pure_python' if self.brain is not None and self.brain.np is None else getattr(self.brain.np, '__name__', None) if self.brain is not None else None,
@@ -14044,7 +14096,7 @@ class GameAgent:
         self.listener = StopListener(self.native, self.stop_vk, self.stop_event, self.stop_gate,
                                      input_callback=input_callback, target_pid=self.capture_target_pid,
                                      target_hwnd=self.capture_target_hwnd,
-                                     consume_stop_key=self.operation != 'cultivate',
+                                     consume_stop_key=True,
                                      injected_callback=self.enqueue_injected_input if self.operation == 'agent' else None)
         self.listener.start()
         self.physical_input_tracking_available = bool(self.operation == 'agent' and self.input_queue is not None
@@ -14067,6 +14119,14 @@ class GameAgent:
                     self.input_queue.get_nowait()
                 except queue.Empty:
                     break
+
+    def handle_physical_input_overflow(self):
+        with self.physical_input_lock:
+            pending = bool(getattr(self, 'physical_input_overflow_pending', False))
+            if pending:
+                self.physical_input_overflow_pending = False
+                self.reset_physical_input_state(clear_queue=True)
+        return pending
 
     def learn_physical_transition(self, candidate):
         if self.brain is None or not candidate or candidate.get('contended'):
@@ -14098,6 +14158,9 @@ class GameAgent:
         return True
 
     def process_physical_input_frame(self, observation, captured_at, rect):
+        if self.handle_physical_input_overflow():
+            self.physical_history.append((captured_at, observation, tuple(rect)))
+            return
         history = list(self.physical_history)
         if self.input_queue is not None:
             while True:
@@ -14105,7 +14168,13 @@ class GameAgent:
                     event = self.input_queue.get_nowait()
                 except queue.Empty:
                     break
-                if isinstance(event, dict) and math.isfinite(float(event.get('at', 0.0))):
+                if not isinstance(event, dict):
+                    continue
+                try:
+                    event_at = float(event.get('at', 0.0))
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if math.isfinite(event_at):
                     self.physical_pending_events.append(event)
         self.physical_pending_events.sort(key=lambda item: float(item.get('at', 0.0)))
         events = []
@@ -14263,6 +14332,14 @@ class GameAgent:
             self.physical_free_mouse = None
         self.physical_history.append((captured_at, observation, tuple(rect)))
 
+    def sync_capture_target(self, capture):
+        self.capture_target_signature = capture.target_signature
+        self.capture_target_pid = capture.target_pid
+        self.capture_target_hwnd = capture.target
+        if self.listener is not None:
+            self.listener.target_pid = int(capture.target_pid or 0)
+            self.listener.target_hwnd = int(capture.target or 0)
+
     def sensor_loop(self):
         com_initialized = self.native.ole.CoInitializeEx(None, 2) in (0, 1)
         local_capture = None
@@ -14276,7 +14353,8 @@ class GameAgent:
                     break
             if not capture_owned:
                 return
-            local_capture = Capture(self.native, self.mode, self.own_hwnd, self.target_hwnd, self.target_identity)
+            local_capture = Capture(self.native, self.mode, self.own_hwnd, self.target_hwnd,
+                                    self.target_identity, activate_target=self.operation == 'agent')
             local_capture.stop_event = self.stop_event
             if self.mode == '窗口' and self.target_identity is None and local_capture.target is None and self.window_hint is not None:
                 if self.native.user.IsWindow(self.window_hint):
@@ -14286,6 +14364,10 @@ class GameAgent:
             self.capture = local_capture
             self.sensor_ready.set()
             while not self.sensor_stop.is_set() and not self.stop_event.is_set():
+                if (self.operation == 'observe' and local_capture.has_bound_target()
+                        and not local_capture.is_target_focused()):
+                    self.sensor_stop.wait(0.05)
+                    continue
                 request = None
                 with self.sensor_condition:
                     if self.detail_requests:
@@ -14314,11 +14396,7 @@ class GameAgent:
                         self.sensor_last_success = captured_at
                         self.sensor_condition.notify_all()
                     consecutive_sensor_errors = 0
-                    self.capture_target_signature = local_capture.target_signature
-                    self.capture_target_pid = local_capture.target_pid
-                    self.capture_target_hwnd = local_capture.target
-                    if self.listener is not None:
-                        self.listener.target_hwnd = int(local_capture.target or 0)
+                    self.sync_capture_target(local_capture)
                     if self.mode == '窗口' and local_capture.target and local_capture.target_signature:
                         self.window_hint = local_capture.target
                     self.sensor_stop.wait(0.02)
@@ -14331,7 +14409,8 @@ class GameAgent:
                         try:
                             signature, pid, hwnd = local_capture.target_signature, local_capture.target_pid, local_capture.target
                             local_capture.close()
-                            local_capture = Capture(self.native, self.mode, self.own_hwnd, self.target_hwnd, self.target_identity)
+                            local_capture = Capture(self.native, self.mode, self.own_hwnd, self.target_hwnd,
+                                                    self.target_identity, activate_target=self.operation == 'agent')
                             local_capture.stop_event = self.stop_event
                             if local_capture.target_signature is None:
                                 local_capture.target_signature = signature
@@ -14339,6 +14418,7 @@ class GameAgent:
                                 if hwnd and self.native.user.IsWindow(hwnd) and local_capture._same_target(hwnd):
                                     local_capture.target = hwnd
                             self.capture = local_capture
+                            self.sync_capture_target(local_capture)
                             consecutive_sensor_errors = 0
                         except Exception as renew_exc:
                             self.error(renew_exc)
@@ -14358,9 +14438,7 @@ class GameAgent:
         finally:
             self.sensor_ready.set()
             if local_capture is not None:
-                self.capture_target_signature = local_capture.target_signature
-                self.capture_target_pid = local_capture.target_pid
-                self.capture_target_hwnd = local_capture.target
+                self.sync_capture_target(local_capture)
                 try:
                     local_capture.close()
                 except Exception as exc:
@@ -14472,21 +14550,22 @@ class GameAgent:
         self.input_dispatch_tracker.expected(event)
 
     def enqueue_physical_input(self, event):
-        if self.operation == 'agent' and isinstance(event, dict):
-            with self.physical_input_lock:
+        with self.physical_input_lock:
+            if self.operation in ('observe', 'agent') and isinstance(event, dict):
                 self.physical_input_generation += 1
-        if self.input_queue is None:
-            return
-        try:
-            self.input_queue.put_nowait(event)
-        except queue.Full:
-            if self.operation == 'agent':
-                with self.physical_input_lock:
-                    self.physical_input_generation += 1
-                    self.physical_input_overflow = True
+            if self.input_queue is None:
+                return
+            try:
+                self.input_queue.put_nowait(event)
+            except queue.Full:
+                self.physical_input_generation += 1
+                self.physical_input_overflow = True
+                self.physical_input_overflow_pending = True
 
     def drain_agent_physical_events(self):
         if self.operation != 'agent' or self.input_queue is None:
+            return
+        if self.handle_physical_input_overflow():
             return
         while True:
             try:
@@ -14734,6 +14813,14 @@ class GameAgent:
                     self.ensure_listener()
                     if self.capture is None or self.sensor_stop.is_set():
                         self.start_sensor()
+                    if (self.capture is not None and self.capture.has_bound_target()
+                            and not self.capture.is_target_focused()):
+                        previous_raw = None
+                        previous_observation = None
+                        previous_rect = None
+                        previous_time = None
+                        self.stop_event.wait(0.05)
+                        continue
                     if self.brain is None:
                         self.brain = Brain(self.folder, self.stop_vk, self.np)
                         if self.brain.store_problem:
@@ -14873,7 +14960,11 @@ class GameAgent:
                         self.brain.store_problem = None
                     self.note_stage_cost('cultivation', time.perf_counter() - started)
                     self.safe_status()
-                    wait_duration = max(0.001, self.brain.storage_cost_ema, self.brain.training_cost_ema, time.perf_counter() - started)
+                    if self.learning_activity == 'waiting_for_saved_experience':
+                        self.stop_event.wait()
+                        break
+                    wait_duration = max(0.05, self.brain.storage_cost_ema,
+                                        self.brain.training_cost_ema, time.perf_counter() - started)
                     self.stop_event.wait(wait_duration)
                 except Exception as exc:
                     self.phase = 'recovering'
@@ -15086,7 +15177,8 @@ class GameAgent:
                         execution_started = time.perf_counter()
                         completed = self.controller.execute(action, obs, rect, self.brain.stagnation, parameters,
                                                             monitor=(lambda previous=obs: self.action_monitor(previous)),
-                                                            feedback_delay=self.brain.game.feedback_delay)
+                                                            feedback_delay=self.brain.game.feedback_delay,
+                                                            feedback_reference=feedback_time_reference(self.brain.game))
                         self.note_stage_cost('action_execution', time.perf_counter() - execution_started)
                         action_detail = self.controller.last_action_detail
                         if self.operation == 'agent' and self.physical_input_tracking_available:
@@ -17532,6 +17624,14 @@ if sys.platform == 'win32':
         vision.close()
     if win.com_initialized:
         win.ole.CoUninitialize()
+stale = engine.NativeDXGI.__new__(engine.NativeDXGI)
+stale.outputs = [((0, 0, 4, 2), None, 0, 1)]
+stale.buffer = bytes((10, 20, 30, 255)) * 8
+stale.frame_protected = False
+stale._select = lambda region: 0
+stale._connect = lambda index: None
+stale._capture = lambda index: False
+assert stale.grab((0, 0, 4, 2), 4, 2) is None
 multi = engine.NativeDXGI.__new__(engine.NativeDXGI)
 multi.outputs = [((0, 0, 4, 2), None, 0, 1), ((4, 0, 8, 2), None, 0, 1)]
 multi.pitch = 16
@@ -17628,6 +17728,26 @@ focus_capture.target_last_focus_attempt = 0.0
 focus_capture.n = type('FocusNative', (), {'user': focus_user})()
 focus_capture._same_target = lambda hwnd: hwnd == 42
 assert focus_capture.ensure_target_focus() and focus_user.foreground == 42
+assert focus_capture.has_bound_target()
+focus_user.foreground = 7
+focus_capture.activate_target = False
+assert not focus_capture.ensure_target_focus() and focus_user.foreground == 7
+assert engine.physical_mouse_preserve_state({'left', 'x1', 'x2'}) == {
+    engine.MOUSEEVENTF_LEFTDOWN, ('x', 1), ('x', 2)}
+listener_probe = engine.StopListener.__new__(engine.StopListener)
+listener_probe.event_healthy = lambda: False
+listener_probe.poll_healthy = lambda: True
+assert not listener_probe.healthy()
+listener_probe.event_healthy = lambda: True
+assert listener_probe.healthy()
+sync_probe = engine.GameAgent.__new__(engine.GameAgent)
+sync_probe.listener = type('ListenerProbe', (), {})()
+sync_capture = type('CaptureProbe', (), {'target_signature': ('class', 'exe', 'title'),
+    'target_pid': 321, 'target': 654})()
+sync_probe.sync_capture_target(sync_capture)
+assert sync_probe.capture_target_signature == sync_capture.target_signature
+assert sync_probe.capture_target_pid == 321 and sync_probe.capture_target_hwnd == 654
+assert sync_probe.listener.target_pid == 321 and sync_probe.listener.target_hwnd == 654
 cap._candidate_visual_evidence = lambda hwnd: True
 cap.target_candidate_since = engine.time.monotonic() - 2.5
 cap.target_candidate_count = 4
@@ -17648,6 +17768,18 @@ assert engine.supervisor_stall_reason({'phase': 'acting', 'stage_progress_age': 
     'sensor_progress_age': 0, 'stage_costs': {'perception': 350}}, 140, 0, 139, 10, 139, 10, 139, 139, True)
 assert engine.supervisor_stall_reason({'phase': 'acting', 'stage_progress_age': 1,
     'sensor_progress_age': 0, 'stage_costs': {'perception': 350}}, 140, 0, 120, 10, 139, 10, 100, 10, False)
+waiting_snapshot = {'phase': 'waiting_for_experience', 'operation': 'cultivate',
+    'learning_activity': 'waiting_for_saved_experience', 'stage_progress_age': 900,
+    'sensor_progress_age': 900, 'stage_costs': {}}
+assert engine.supervisor_stall_reason(waiting_snapshot, 140, 0, 139, 10, 139, 10, 139, 10, True) is None
+input_stall = engine.supervisor_stall_reason({'phase': 'acting', 'operation': 'agent',
+    'stage_progress_age': 1, 'sensor_progress_age': 0, 'stage_costs': {}},
+    140, 0, 139, 10, 139, 139, 139, 139, True)
+assert input_stall == '游戏输入执行长时间没有推进'
+learning_stall = engine.supervisor_stall_reason({'phase': 'cultivating', 'operation': 'cultivate',
+    'learning_activity': 'training_saved_experience', 'stage_progress_age': 1,
+    'sensor_progress_age': 0, 'stage_costs': {}}, 140, 0, 139, 139, 139, 10, 139, 139, True)
+assert learning_stall == '学习更新长时间没有推进'
 assert engine.population_count(0) == 0 and engine.population_count(45) == 4
 assert engine.population_count(-45) == 4
 assert engine.action_feedback_is_valid((0, 0, 1, 1), (0, 0, 1, 1),
@@ -17704,6 +17836,10 @@ flag = engine.threading.Event()
 control = engine.Controller(fake, stop_vk, flag)
 control.ledger_path = workspace / 'active_inputs.json'
 control.stop_gate = engine.StopKeyGate(fake, stop_vk, flag)
+side_button_control = engine.Controller(fake, stop_vk, engine.threading.Event())
+side_button_control.mouse_down = {('x', 1), ('x', 2)}
+assert side_button_control.release(preserve_mouse=engine.physical_mouse_preserve_state({'x1', 'x2'}))
+assert side_button_control.mouse_down == {('x', 1), ('x', 2)}
 saved_state_reader = fake.user.GetAsyncKeyState
 fake.user.GetAsyncKeyState = lambda key: 1
 lsb_gate = engine.StopKeyGate(fake, stop_vk, engine.threading.Event())
@@ -17729,6 +17865,11 @@ assert engine.worker_progress_snapshot(workspace, 'test-session', WorkerIdentity
 assert engine.worker_progress_snapshot(workspace, 'another-session', WorkerIdentity()) is None
 progress_path.unlink()
 candidate = next(v for v in (65, 66, 67, 68, 70, 71, 72) if not engine.stop_equivalent(v, stop_vk))
+assert engine.stop_equivalent(160, 16) and engine.stop_equivalent(161, 16)
+assert engine.stop_equivalent(16, 160) and not engine.stop_equivalent(161, 160)
+assert not engine.stop_equivalent(160, 161)
+assert any(item.kind == 'key' and item.a == 161 for item in engine.actions_for(160))
+assert not any(item.kind == 'chord' and item.a == 16 for item in engine.actions_for(160))
 class StopGateProbe:
     def __init__(self):
         self.events = []
@@ -17846,6 +17987,74 @@ camera_observation = type('CameraObservation', (), {'rect': old_screen.rect, 'ra
     'change': 0.005, 'interaction_targets': [], 'attention_points': [], 'ui_text': []})()
 assert monitor_agent.action_monitor(camera_observation) is True
 assert monitor_agent.monitor_camera_suppressed == 1
+overflow_probe = engine.GameAgent.__new__(engine.GameAgent)
+overflow_probe.operation = 'observe'
+overflow_probe.input_queue = engine.queue.Queue(maxsize=1)
+overflow_probe.physical_input_lock = engine.threading.Lock()
+overflow_probe.physical_input_generation = 0
+overflow_probe.physical_input_overflow = False
+overflow_probe.physical_input_overflow_pending = False
+overflow_probe.physical_history = engine.deque([(0.0, old_screen, old_screen.rect)], maxlen=32)
+overflow_probe.physical_pending_events = [{'at': 0.0}]
+overflow_probe.physical_active_keys = {65: {'at': 0.0}}
+overflow_probe.physical_active_mouse = {'left': {'at': 0.0}}
+overflow_probe.physical_last_mouse = (1, 1)
+overflow_probe.physical_free_mouse = {'before': old_screen}
+overflow_probe.enqueue_physical_input({'type': 'key', 'vk': 65, 'down': True, 'at': 1.0})
+overflow_probe.enqueue_physical_input({'type': 'key', 'vk': 65, 'down': False, 'at': 2.0})
+assert overflow_probe.physical_input_overflow and overflow_probe.physical_input_overflow_pending
+assert overflow_probe.handle_physical_input_overflow()
+assert not overflow_probe.physical_input_overflow_pending and overflow_probe.input_queue.empty()
+assert not overflow_probe.physical_history and not overflow_probe.physical_pending_events
+assert not overflow_probe.physical_active_keys and not overflow_probe.physical_active_mouse
+assert overflow_probe.physical_input_overflow
+class EmptyLearningBrain:
+    def __init__(self):
+        self.memory = []
+        self.training_queue = []
+        self.storage_cost_ema = 0.0
+        self.training_cost_ema = 0.0
+        self.training_problem = None
+        self.storage_problem = None
+        self.store_problem = None
+        self.calls = []
+    def ensure_workers(self):
+        self.calls.append('ensure_workers')
+    def queue_replay(self):
+        self.calls.append('queue_replay')
+    def save(self, force=False):
+        self.calls.append(('save', bool(force)))
+    def flush_pending(self, done=False):
+        self.calls.append(('flush_pending', bool(done)))
+    def stop_training(self):
+        self.calls.append('stop_training')
+    def close(self):
+        self.calls.append('close')
+class GuardianProbe:
+    def close(self):
+        pass
+empty_agent = engine.GameAgent.__new__(engine.GameAgent)
+empty_agent.stop_event = engine.threading.Event()
+empty_agent.stop_event.wait = lambda timeout=None: empty_agent.stop_event.set() or False
+empty_agent.check_stop_fallback = lambda: empty_agent.stop_event.is_set()
+empty_agent.safe_status = lambda force=False: None
+empty_agent.ensure_listener = lambda: None
+empty_agent.brain = EmptyLearningBrain()
+empty_agent.phase = 'initializing'
+empty_agent.learning_activity = 'initializing'
+empty_agent.last_stage_progress = engine.time.monotonic()
+empty_agent.activity_tick = 0
+empty_agent.note_stage_cost = lambda name, elapsed: None
+empty_agent.error = lambda exception: None
+empty_agent.listener = None
+empty_agent.guardian = GuardianProbe()
+empty_agent.on_input_released = None
+empty_agent.input_release_verified = None
+empty_agent.cleanup_capture = lambda: None
+empty_agent.run_cultivation()
+assert empty_agent.learning_activity == 'waiting_for_saved_experience'
+assert empty_agent.brain.calls.count('queue_replay') == 1
+assert ('save', False) in empty_agent.brain.calls and ('save', True) in empty_agent.brain.calls
 monitor_agent.physical_input_tracking_available = False
 monitor_agent.sensor_frame = (local_frame, old_screen.rect, engine.time.monotonic(), 14)
 monitor_agent.monitor_candidate_sequence = -1
@@ -17977,6 +18186,9 @@ legacy_keys, legacy_mouse, legacy_touch = engine.normalize_input_ledger(
 assert legacy_keys == {65, 27} and legacy_mouse == {engine.MOUSEEVENTF_LEFTDOWN} and not legacy_touch
 assert engine.temporal_discount(0.1, 0.1) == engine.DISCOUNT
 assert engine.temporal_discount(0.1, 0.2) > engine.temporal_discount(0.1, 0.1)
+assert abs(engine.adaptive_action_tempo(0.2, 0.1) - 0.5) < 1e-9
+assert engine.adaptive_action_tempo(0.1, 0.2) == 1.30
+assert engine.adaptive_action_tempo(0.1, 0.1) == 1.0
 reference_game = type('ReferenceGame', (), {'feedback_delay': 0.12, 'feedback_latency_by_kind': {'move': [0.08, 2]}})()
 assert abs(engine.feedback_time_reference(reference_game) - 0.10) < 0.000001
 try:
@@ -17996,15 +18208,25 @@ try:
     assert store.verify_roundtrip()
     capacity_observation = type('CapacityObservation', (), {'raw': base_frame, 'novelty': 1.0,
         'signature': 'capacity-test', 'valid': True, 'frame_uid': 'capacity-test'})()
+    original_disk_bytes = engine.available_disk_bytes
     original_storage_snapshot = engine.storage_resource_snapshot
     try:
-        engine.storage_resource_snapshot = lambda folder: {'storage_capacity_factor': 0.0}
+        engine.available_disk_bytes = lambda folder: 0
         assert not store.frame('capacity-test', 1, 'initial', capacity_observation, force=True)
         assert store.capacity_frames_skipped == 1
+        engine.available_disk_bytes = lambda folder: 1 << 40
+        engine.storage_resource_snapshot = lambda folder: (_ for _ in ()).throw(AssertionError('关键帧写入不得递归扫描存储目录'))
+        assert store.frame('capacity-test', 1, 'initial', capacity_observation, force=True)
     finally:
+        engine.available_disk_bytes = original_disk_bytes
         engine.storage_resource_snapshot = original_storage_snapshot
 finally:
     store.close()
+scan_probe = workspace / 'storage_scan_probe'
+(scan_probe / 'nested').mkdir(parents=True)
+(scan_probe / 'root.bin').write_bytes(b'root')
+(scan_probe / 'nested' / 'deep.bin').write_bytes(b'x' * 4096)
+assert engine.storage_resource_snapshot(scan_probe)['persistent_data_bytes'] == 4
 resource_snapshot = engine.storage_resource_snapshot(workspace)
 assert 0.0 <= resource_snapshot['storage_capacity_factor'] <= 1.0
 assert resource_snapshot['persistent_data_bytes'] >= 0
@@ -18341,11 +18563,12 @@ try:
 finally:
     store.close()
 '''
-    command = [sys.executable, '-I', '-c', script, str(folder), str(pathlib.Path(__file__).resolve()),
+    bootstrap = "import sys;exec(compile(sys.stdin.buffer.read().decode('utf-8'), '<offline-preflight>', 'exec'))"
+    command = [sys.executable, '-I', '-c', bootstrap, str(folder), str(pathlib.Path(__file__).resolve()),
                str(workspace), backend, str(stop_vk), mode, str(int(target_hwnd or 0)),
                json.dumps(list(target_identity or ()), ensure_ascii=False, separators=(',', ':')), *installed_paths]
     try:
-        run = subprocess.run(command, capture_output=True, stdin=subprocess.DEVNULL, timeout=120,
+        run = subprocess.run(command, input=script.encode('utf-8'), capture_output=True, timeout=120,
                              creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
         if run.returncode != 0:
             message = run.stderr.decode('utf-8', errors='replace')[-700:]
@@ -19161,10 +19384,19 @@ def supervisor_stall_reason(snapshot, now, born, last_heartbeat, last_input, las
         sensor_limit = max(heartbeat_interval * 5.0, stage_limit * 0.55)
         if phase in ('observing', 'capturing') and sensor_age > sensor_limit and now - last_sensor > sensor_limit:
             return '游戏画面采集长时间没有产生新帧'
-        if phase in ('acting', 'learning', 'recovering', 'cultivating', 'waiting_for_experience', 'initializing', 'observing') and stage_age > stage_limit:
+        operation = str(snapshot.get('operation') or '')
+        learning_activity = str(snapshot.get('learning_activity') or '')
+        if operation == 'cultivate' and (phase == 'waiting_for_experience'
+                or learning_activity == 'waiting_for_saved_experience'):
+            return None
+        if operation == 'agent' and phase == 'acting' and now - last_input > stage_limit:
+            return '游戏输入执行长时间没有推进'
+        if operation in ('agent', 'cultivate') and phase in ('learning', 'cultivating'):
+            if operation != 'cultivate' or learning_activity == 'training_saved_experience':
+                if now - last_learning > stage_limit:
+                    return '学习更新长时间没有推进'
+        if phase in ('acting', 'learning', 'recovering', 'cultivating', 'initializing', 'observing') and stage_age > stage_limit:
             return '执行主循环超过实测阶段耗时仍未推进'
-        if phase == 'cultivating' and now - last_progress > stage_limit:
-            return '后台学习循环长时间没有推进'
     except (TypeError, ValueError, OverflowError):
         return '执行进程心跳数据无效'
     return None
@@ -19220,8 +19452,8 @@ def run_agent_subprocess(configuration):
     if not isinstance(session, str) or len(session) != 32 or any(item not in '0123456789abcdef' for item in session):
         raise ValueError('Agent 子进程运行标识无效')
     enable_dpi_awareness()
-    if operation == 'cultivate':
-        set_current_process_background_priority()
+    background_priority_applied = (set_current_process_background_priority()
+                                    if operation == 'cultivate' else None)
     native = Native()
     try:
         numeric = read_worker_backend(folder, configuration.get('backend', 'pure_python'),
@@ -19229,6 +19461,7 @@ def run_agent_subprocess(configuration):
         input_queue = queue.Queue(maxsize=8192) if operation in ('observe', 'agent') else None
         agent = GameAgent(native, folder, mode, stop_vk, int(configuration['owner']), numeric,
                           target_hwnd, target_identity, operation, input_queue)
+        agent.background_priority_applied = background_priority_applied
         agent.externally_supervised = True
         stopped = agent.stop_event
         agent.stop_gate.allow_local_press = False
@@ -19248,6 +19481,7 @@ def run_agent_subprocess(configuration):
                          'sensor_frames': agent.sensor_frames_total, 'completed_actions': agent.completed_actions,
                          'partial_actions': agent.partial_actions, 'feedback_captures': agent.feedback_captures,
                          'physical_input_samples': agent.physical_input_samples,
+                         'physical_input_generation': agent.physical_input_generation,
                          'input_attempts': controller.attempted_action_inputs if controller is not None else 0,
                          'input_dispatches': controller.successful_action_inputs if controller is not None else 0,
                          'input_failures': controller.failed_inputs if controller is not None else 0,
@@ -19273,6 +19507,8 @@ def run_agent_subprocess(configuration):
                          'user_observed_action_samples': sum(agent.brain.game.user_action_samples) if agent.brain is not None else 0,
                          'user_observed_action_types': sum(1 for value in agent.brain.game.user_action_samples if value > 0) if agent.brain is not None else 0,
                          'learning_activity': agent.learning_activity,
+                         'background_process_priority_applied': agent.background_priority_applied,
+                         'training_thread_priority_applied': agent.brain.training_priority_applied if agent.brain is not None else None,
                          'training_heartbeat_age': max(0.0, now - agent.brain.training_last_tick)
                          if agent.brain is not None else None,
                          'storage_heartbeat_age': max(0.0, now - agent.brain.storage_last_tick)
@@ -19781,7 +20017,7 @@ class App:
             gate = StopKeyGate(self.n, stop_vk, stop_event)
             gate.on_stop = lambda: self.n.user.PostMessageW(self.hwnd, WM_APP_STOP_REQUESTED, 0, 0)
             listener = StopListener(self.n, stop_vk, stop_event, gate, input_callback=lambda event: None,
-                                    consume_stop_key=operation != 'cultivate')
+                                    consume_stop_key=True)
             listener.start()
             self.recovery_listener = listener
             self.stop_event, self.stop_gate = stop_event, gate
@@ -19794,7 +20030,7 @@ class App:
                 self.stop_gate = None
                 self.set_status('已停止')
                 return
-            guardian = StopGuardian(stop_vk, gate, stop_event, consume_stop_key=operation != 'cultivate')
+            guardian = StopGuardian(stop_vk, gate, stop_event, consume_stop_key=True)
             try:
                 guardian.start()
             except (OSError, ValueError):
@@ -19810,7 +20046,7 @@ class App:
             self.write_supervisor_state('starting')
             worker = threading.Thread(target=self.agent_worker, name='AgentSupervisor', daemon=False)
             self.worker = worker
-            self.n.user.ShowWindow(self.hwnd, 0)
+            self.n.user.ShowWindow(self.hwnd, 6)
             worker.start()
         except BaseException as exc:
             self.running = False
@@ -19890,15 +20126,7 @@ class App:
                                 164: {18, 164, 165}, 165: {18, 164, 165}}
             preserved_keys = {vk for vk in keys
                               if (modifier_aliases.get(vk, {vk}) & physical_keys)}
-            physical_mouse_flags = set()
-            if 'left' in physical_mouse:
-                physical_mouse_flags.add(MOUSEEVENTF_LEFTDOWN)
-            if 'right' in physical_mouse:
-                physical_mouse_flags.add(MOUSEEVENTF_RIGHTDOWN)
-            if 'middle' in physical_mouse:
-                physical_mouse_flags.add(MOUSEEVENTF_MIDDLEDOWN)
-            if any(str(button).startswith('x') for button in physical_mouse):
-                physical_mouse_flags.add(MOUSEEVENTF_XDOWN)
+            physical_mouse_flags = physical_mouse_preserve_state(physical_mouse)
             control = Controller(self.n, stop_vk, threading.Event())
             control.ledger_path = ledger
             control.down = keys
@@ -19957,6 +20185,7 @@ class App:
                     previous_sensor_frames = None
                     previous_actions = None
                     previous_learning = None
+                    previous_phase = None
                     last_sensor_progress = born
                     last_input_progress = born
                     last_learning_progress = born
@@ -19993,7 +20222,7 @@ class App:
                                     self.stop_listener.close()
                                 self.stop_listener = StopListener(self.n, self.process_stop_vk,
                                                                   self.stop_event, self.stop_gate,
-                                                                  consume_stop_key=self.process_operation != 'cultivate')
+                                                                  consume_stop_key=True)
                                 self.stop_listener.start()
                             except BaseException as exc:
                                 self.record_supervisor_failure(exc)
@@ -20004,6 +20233,13 @@ class App:
                                 self.record_supervisor_failure(exc)
                         now = time.monotonic()
                         if snapshot is not None:
+                            phase = str(snapshot.get('phase') or '')
+                            if phase != previous_phase:
+                                if phase == 'acting':
+                                    last_input_progress = now
+                                if phase in ('learning', 'cultivating'):
+                                    last_learning_progress = now
+                                previous_phase = phase
                             try:
                                 heartbeat_stamp = float(snapshot.get('at') or 0.0)
                             except (TypeError, ValueError, OverflowError):
@@ -20013,7 +20249,10 @@ class App:
                                 last_heartbeat = now
                             sensor_frames = snapshot.get('sensor_frames')
                             action_signature = (snapshot.get('input_dispatches'), snapshot.get('completed_actions'),
-                                                snapshot.get('partial_actions'), snapshot.get('feedback_captures'))
+                                                snapshot.get('partial_actions'), snapshot.get('feedback_captures'),
+                                                 snapshot.get('physical_input_generation'),
+                                                 snapshot.get('physical_input_samples'),
+                                                 snapshot.get('physical_interference_actions'))
                             learning_signature = (snapshot.get('steps'), snapshot.get('training_updates'))
                             if sensor_frames != previous_sensor_frames:
                                 previous_sensor_frames = sensor_frames
