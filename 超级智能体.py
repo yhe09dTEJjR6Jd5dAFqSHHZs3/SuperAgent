@@ -2,6 +2,7 @@ import ctypes
 import gzip
 import hashlib
 import importlib
+import io
 import json
 import locale
 import re
@@ -53,7 +54,6 @@ DISCOUNT = 0.92
 TIME_REFERENCE_SECONDS = 0.24
 N_STEP = 6
 LONG_GOAL_DISCOUNT = 0.996
-LONG_GOAL_HORIZON = 128
 INPUT_LEDGER_SCHEMA = 1
 _SYSTEM_CPU_LOCK = threading.Lock()
 _SYSTEM_CPU_API = None
@@ -99,21 +99,30 @@ def storage_resource_snapshot(folder):
     except (OSError, ValueError, TypeError):
         total = None
         free = None
-    names = ('experience.sqlite3', 'experience.sqlite3-wal', 'experience.sqlite3-shm',
-             'experience_overflow.jsonl', 'learning_state.json.gz', 'learning_delta.json.gz',
-             'runtime_state.json', 'runtime_profile.json')
     persistent = 0
-    for name in names:
+    pending = [path]
+    while pending:
+        current = pending.pop()
         try:
-            persistent += (path / name).stat().st_size
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_symlink():
+                            continue
+                        if entry.is_file(follow_symlinks=False):
+                            persistent += int(entry.stat(follow_symlinks=False).st_size)
+                        elif entry.is_dir(follow_symlinks=False):
+                            pending.append(pathlib.Path(entry.path))
+                    except OSError:
+                        continue
         except OSError:
-            pass
-    factor = (free / (free + persistent) if free is not None and free + persistent > 0 else
-              1.0 if free is None else 0.0)
+            continue
+    fraction = free / total if free is not None and total is not None and total > 0 else None
+    factor = max(0.0, min(1.0, fraction)) if fraction is not None else 0.0
     return {'disk_total_bytes': total, 'disk_free_bytes': free,
             'persistent_data_bytes': persistent,
-            'disk_free_fraction': free / total if free is not None and total else None,
-            'storage_capacity_factor': max(0.0, min(1.0, factor))}
+            'disk_free_fraction': fraction,
+            'storage_capacity_factor': factor}
 
 
 def system_cpu_load():
@@ -184,7 +193,7 @@ def action_elapsed_seconds(detail, reference_seconds=None):
         seconds = float(value)
     except (ValueError, TypeError, OverflowError):
         return float(fallback)
-    return max(0.03, min(8.0, seconds)) if math.isfinite(seconds) else float(fallback)
+    return max(0.03, seconds) if math.isfinite(seconds) else float(fallback)
 
 
 def transition_time_reference(transition):
@@ -193,7 +202,7 @@ def transition_time_reference(transition):
         try:
             value = float(value)
             if math.isfinite(value) and value > 0.0:
-                return max(0.01, min(8.0, value))
+                return max(0.01, value)
         except (ValueError, TypeError, OverflowError):
             pass
     return TIME_REFERENCE_SECONDS
@@ -202,7 +211,7 @@ def transition_time_reference(transition):
 def transition_elapsed_seconds(transition, reference_seconds=None):
     reference = transition_time_reference(transition) if reference_seconds is None else reference_seconds
     try:
-        reference = max(0.01, min(8.0, float(reference)))
+        reference = max(0.01, float(reference))
     except (ValueError, TypeError, OverflowError):
         reference = TIME_REFERENCE_SECONDS
     if len(transition) > 9 and isinstance(transition[9], dict):
@@ -211,7 +220,7 @@ def transition_elapsed_seconds(transition, reference_seconds=None):
             try:
                 value = float(data['cumulative_elapsed_seconds'])
                 if math.isfinite(value):
-                    return max(0.03, min(48.0, value))
+                    return max(0.03, value)
             except (ValueError, TypeError, OverflowError):
                 pass
         return action_elapsed_seconds(data, reference) * max(1, int(transition[7])) if 'effective_elapsed_seconds' not in data and int(transition[7]) > 1 else action_elapsed_seconds(data, reference)
@@ -219,13 +228,13 @@ def transition_elapsed_seconds(transition, reference_seconds=None):
 
 
 def temporal_discount(seconds, reference_seconds=None):
-    reference = TIME_REFERENCE_SECONDS if reference_seconds is None else max(0.01, min(8.0, float(reference_seconds)))
-    return DISCOUNT ** (max(0.0, min(48.0, float(seconds))) / reference)
+    reference = TIME_REFERENCE_SECONDS if reference_seconds is None else max(0.01, float(reference_seconds))
+    return DISCOUNT ** (max(0.0, float(seconds)) / reference)
 
 
 def long_goal_discount(seconds, reference_seconds=None):
-    reference = TIME_REFERENCE_SECONDS if reference_seconds is None else max(0.01, min(8.0, float(reference_seconds)))
-    return LONG_GOAL_DISCOUNT ** (max(0.0, min(180.0, float(seconds))) / reference)
+    reference = TIME_REFERENCE_SECONDS if reference_seconds is None else max(0.01, float(reference_seconds))
+    return LONG_GOAL_DISCOUNT ** (max(0.0, float(seconds)) / reference)
 
 
 def feedback_time_reference(game):
@@ -250,7 +259,7 @@ def feedback_time_reference(game):
     values.sort()
     middle = len(values) // 2
     median = values[middle] if len(values) % 2 else (values[middle - 1] + values[middle]) * 0.5
-    return max(0.035, min(1.30, median))
+    return max(0.01, median)
 
 
 def supported_goal_training(transition):
@@ -296,6 +305,56 @@ def temporal_response_confidence(frame_deltas, interval_deltas, passive, stabili
     drift = max(0.0, min(1.0, ongoing / max(0.012, peak)))
     steady = max(0.0, min(1.0, float(stability))) if isinstance(stability, (int, float)) and math.isfinite(stability) else 0.0
     return max(0.20, min(1.0, 0.25 + 0.35 * retained + 0.27 * steady + 0.13 * (1.0 - drift)))
+
+
+def adaptive_visual_thresholds(game, natural_change, elapsed_seconds, point_count):
+    natural = float(natural_change) if isinstance(natural_change, (int, float)) and math.isfinite(float(natural_change)) else 0.0
+    elapsed = float(elapsed_seconds) if isinstance(elapsed_seconds, (int, float)) and math.isfinite(float(elapsed_seconds)) else 0.0
+    natural = max(0.0, natural)
+    elapsed = max(0.0, elapsed)
+    rates = []
+    deviations = []
+    if game is not None:
+        timed_records = getattr(game, 'passive_timed', {})
+        if not hasattr(timed_records, 'values'):
+            timed_records = {}
+        for record in timed_records.values():
+            if not isinstance(record, (list, tuple)) or len(record) < 3:
+                continue
+            try:
+                rate = float(record[0])
+                variance = float(record[1])
+                count = int(record[2])
+                if count > 0 and math.isfinite(rate) and math.isfinite(variance) and variance >= 0.0:
+                    rates.append(max(0.0, rate))
+                    deviations.append(math.sqrt(variance))
+            except (TypeError, ValueError, OverflowError):
+                continue
+    if rates:
+        rates.sort()
+        deviations.sort()
+        middle = len(rates) // 2
+        baseline_rate = rates[middle] if len(rates) % 2 else (rates[middle - 1] + rates[middle]) * 0.5
+        middle = len(deviations) // 2
+        deviation_rate = deviations[middle] if len(deviations) % 2 else (deviations[middle - 1] + deviations[middle]) * 0.5
+    else:
+        baseline_rate = natural / elapsed if elapsed > 0.0 else natural
+        deviation_rate = baseline_rate
+    try:
+        passive_value = float(getattr(game, 'passive_change', 0.0) or 0.0) if game is not None else 0.0
+    except (TypeError, ValueError, OverflowError):
+        passive_value = 0.0
+    passive = max(natural, passive_value if math.isfinite(passive_value) else 0.0)
+    expected_noise = max(passive, baseline_rate * elapsed)
+    uncertainty = deviation_rate * elapsed
+    floor = 1.0 / 765.0
+    global_threshold = min(1.0, max(floor, expected_noise + uncertainty))
+    regional_threshold = min(1.0, max(global_threshold,
+        expected_noise + uncertainty * math.sqrt(2.0 * math.log(13.0))))
+    focus_trials = max(2, int(point_count) + 1)
+    focused_threshold = min(1.0, max(global_threshold,
+        expected_noise + uncertainty * math.sqrt(2.0 * math.log(focus_trials))))
+    return {'global': global_threshold, 'regional': regional_threshold, 'focused': focused_threshold}
 
 
 def camera_frame_alignment(before, after):
@@ -670,6 +729,7 @@ class Native:
             (self.user, 'IsWindow', [HWND], ctypes.c_int),
             (self.user, 'IsIconic', [HWND], ctypes.c_int),
             (self.user, 'SetForegroundWindow', [HWND], ctypes.c_int),
+            (self.user, 'BringWindowToTop', [HWND], ctypes.c_int),
             (self.user, 'GetDC', [HWND], HWND),
             (self.user, 'ReleaseDC', [HWND, HWND], ctypes.c_int),
             (self.user, 'GetAsyncKeyState', [ctypes.c_int], ctypes.c_short),
@@ -939,7 +999,8 @@ class StopKeyGate:
         self.poll_consecutive_down = 0
         self.poll_consecutive_up = 0
         self.prefer_physical_events = False
-        self.trusted_source_tick = 0.0
+        self.last_poll_at = None
+        self.poll_interval_ema = 0.0
         self.allow_local_press = True
         self.last_physical_event = 0.0
         self.on_stop = None
@@ -973,7 +1034,7 @@ class StopKeyGate:
         with self.lock:
             self.injected_down = bool(pressed)
             if not pressed:
-                self.injected_release_grace_until = time.monotonic() + 0.12
+                self.injected_release_grace_until = time.monotonic() + self.poll_interval_ema * 2.0
 
     def injected_blocked(self):
         with self.lock:
@@ -982,10 +1043,10 @@ class StopKeyGate:
     def prefer_trusted_sources(self, active):
         with self.lock:
             self.prefer_physical_events = bool(active)
-            self.trusted_source_tick = time.monotonic() if active else 0.0
 
     def poll(self, allow_press=True):
         allow_press = bool(allow_press and self.allow_local_press)
+        now = time.monotonic()
         try:
             pressed = bool(int(self.native.user.GetAsyncKeyState(self.vk)) & 0x8000)
         except Exception:
@@ -993,6 +1054,12 @@ class StopKeyGate:
             return self.stop_event.is_set()
         self.poll_accessible = True
         with self.lock:
+            if self.last_poll_at is not None:
+                interval = now - self.last_poll_at
+                if math.isfinite(interval) and interval > 0.0:
+                    self.poll_interval_ema = (0.8 * self.poll_interval_ema + 0.2 * interval
+                                              if self.poll_interval_ema else interval)
+            self.last_poll_at = now
             if pressed:
                 self.poll_consecutive_down = min(1000, self.poll_consecutive_down + 1)
                 self.poll_consecutive_up = 0
@@ -1001,17 +1068,22 @@ class StopKeyGate:
                 self.poll_consecutive_up = min(1000, self.poll_consecutive_up + 1)
                 if self.injected_down:
                     self.injected_down = False
-                    self.injected_release_grace_until = time.monotonic() + 0.12
-            trusted = self.prefer_physical_events and time.monotonic() - self.trusted_source_tick < 0.30
+                    self.injected_release_grace_until = now + self.poll_interval_ema * 2.0
             down_samples = self.poll_consecutive_down
             up_samples = self.poll_consecutive_up
         if not pressed:
             if up_samples >= 2:
                 self.observe(False)
-        elif allow_press and down_samples >= (5 if trusted else 1) and not self.injected_blocked():
+        elif allow_press and down_samples >= 1 and not self.injected_blocked():
             if self.observe(True):
                 self.poll_stops += 1
         return self.stop_event.is_set()
+
+
+def observe_configured_stop_key(gate, vk, stop_vk, pressed):
+    if not stop_equivalent(vk, stop_vk):
+        return False
+    return gate.observe(bool(pressed))
 
 
 class StopGuardian:
@@ -1381,7 +1453,7 @@ class StopListener:
                                     if data.header.hDevice:
                                         self.raw_events += 1
                                         pressed = not bool(keyboard_input.Flags & 1)
-                                        self.gate.observe(pressed)
+                                        observe_configured_stop_key(self.gate, vk, self.stop_vk, pressed)
                                         if (self.input_callback is not None and not self.registered_channels.get('hook')
                                                 and safe_game_key(vk) and not stop_equivalent(vk, self.stop_vk)
                                                 and self.target_is_foreground()):
@@ -1829,6 +1901,7 @@ class Capture:
         self.target_candidate_count = 0
         self.target_candidate_since = 0.0
         self.target_last_focus_attempt = 0.0
+        self.stop_event = None
         self.target_rank = 0
         self.target_candidate_frame = None
         self.target_candidate_motion = 0.0
@@ -2159,6 +2232,36 @@ class Capture:
                     and self._same_target(self.target)
                     and self.n.user.GetForegroundWindow() == self.target)
 
+    def ensure_target_focus(self):
+        if self.mode != '窗口':
+            return True
+        if not self.activate_target:
+            return self.is_target_focused()
+        while True:
+            if self.stop_event is not None and self.stop_event.is_set():
+                return False
+            if not self.target or not self.n.user.IsWindow(self.target) or not self._same_target(self.target):
+                return False
+            if self.is_target_focused():
+                return True
+            now = time.monotonic()
+            if now - self.target_last_focus_attempt >= 0.28:
+                self.target_last_focus_attempt = now
+                if self.n.user.IsIconic(self.target):
+                    self.n.user.ShowWindow(self.target, 9)
+                try:
+                    bring_to_top = getattr(self.n.user, 'BringWindowToTop', None)
+                    if bring_to_top is not None:
+                        bring_to_top(self.target)
+                except Exception:
+                    pass
+                self.n.user.SetForegroundWindow(self.target)
+                if self.is_target_focused():
+                    return True
+            if self.stop_event is None:
+                return self.is_target_focused()
+            self.stop_event.wait(min(0.05, max(0.01, 0.28 - (time.monotonic() - self.target_last_focus_attempt))))
+
     def bounds(self):
         if self.mode == '窗口':
             foreground = self.n.user.GetForegroundWindow()
@@ -2180,19 +2283,13 @@ class Capture:
                 self.target_candidate_count = 0
                 self.target_candidate_since = 0.0
             if self.target and self.n.user.IsWindow(self.target) and self._same_target(self.target):
-                if self.activate_target and self.n.user.IsIconic(self.target):
-                    self.n.user.ShowWindow(self.target, 9)
+                if self.activate_target and not self.ensure_target_focus():
+                    raise OSError('原游戏窗口无法恢复输入焦点或已请求停止')
                 rect = RECT()
                 origin = POINT()
                 if self.n.user.GetClientRect(self.target, ctypes.byref(rect)) and self.n.user.ClientToScreen(self.target, ctypes.byref(origin)):
                     width, height = rect.right - rect.left, rect.bottom - rect.top
                     if width >= 80 and height >= 80:
-                        if self.activate_target:
-                            if not self.is_target_focused() and time.monotonic() - self.target_last_focus_attempt >= 0.28:
-                                self.target_last_focus_attempt = time.monotonic()
-                                self.n.user.SetForegroundWindow(self.target)
-                            if not self.is_target_focused():
-                                raise OSError('原游戏窗口尚未获得输入焦点，正持续尝试恢复')
                         return (origin.x, origin.y, width, height)
             raise OSError('等待有效前台游戏窗口；仅允许稳定绑定或恢复原程序窗口，不切换到无关窗口')
         return (
@@ -3515,13 +3612,15 @@ class ReplayStore:
             return False
         compressed = zlib.compress(obs.raw, 4)
         uid = str(getattr(obs, 'frame_uid', '')) or hashlib.sha256(compressed + str(game).encode() + str(step).encode() + str(action).encode()).hexdigest()
-        capacity = storage_resource_snapshot(self.folder).get('storage_capacity_factor', 1.0)
-        if capacity is not None:
+        capacity = storage_resource_snapshot(self.folder).get('storage_capacity_factor', 0.0)
+        try:
             capacity = max(0.0, min(1.0, float(capacity)))
-            capacity_roll = int(hashlib.sha256(uid.encode('utf-8', 'replace')).hexdigest()[:16], 16) / float(1 << 64)
-            if capacity_roll >= capacity:
-                self.capacity_frames_skipped += 1
-                return False
+        except (TypeError, ValueError, OverflowError):
+            capacity = 0.0
+        capacity_roll = int(hashlib.sha256(uid.encode('utf-8', 'replace')).hexdigest()[:16], 16) / float(1 << 64)
+        if capacity_roll >= capacity:
+            self.capacity_frames_skipped += 1
+            return False
         result = self.db.execute('INSERT INTO keyframes(at,game,step,action,signature,valid,width,height,frame,uid) VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(uid) DO NOTHING', (time.time(), canonical_game_key(game), int(step), action, obs.signature, int(obs.valid), W, H, sqlite3.Binary(compressed), uid))
         self.frame_step[game] = step
         if result.rowcount:
@@ -4508,7 +4607,7 @@ class Brain:
         self.last_plan_parameters = []
         self.last_plan_predictions = []
         self.choice_parameters = None
-        self.outcome_trace = deque(maxlen=LONG_GOAL_HORIZON)
+        self.outcome_trace = deque()
         self.visual_routes = {}
         self.visual_active_base = None
         self.visual_active_key = None
@@ -4625,6 +4724,7 @@ class Brain:
         if available_memory is not None:
             memory_capacity = max(1, min(memory_capacity, available_memory // max(1, self.estimated_transition_bytes * 4)))
         self.memory = deque(maxlen=memory_capacity)
+        self.outcome_trace = deque(maxlen=memory_capacity)
         self.rare_memory = deque(maxlen=max(1, int(memory_capacity * (0.05 if self.np is not None else 0.0714))))
         self.control_memory = deque(maxlen=max(1, int(memory_capacity * 0.04)))
         self.failure_memory = deque(maxlen=max(1, int(memory_capacity * 0.04)))
@@ -12046,7 +12146,7 @@ class Brain:
                    if item[0] == self.game_key and item[7] == 1
                    and len(item) > 9 and isinstance(item[9], dict)
                    and item[9].get('learning_episode_id') == self.game.episode_id]
-        recent = history[-min(LONG_GOAL_HORIZON, len(history)):-1]
+        recent = history[:-1]
         elapsed = transition_elapsed_seconds(history[-1], transition_time_reference(history[-1])) if history else feedback_time_reference(self.game)
         credited = 0
         for distance, prior in enumerate(reversed(recent), 2):
@@ -12714,7 +12814,7 @@ class Brain:
                 if self.background_training and self.training_cost_ema > 0.0:
                     load = system_cpu_load()
                     metrics = self.storage_metrics_snapshot()
-                    capacity_factor = max(0.0, min(1.0, float(metrics.get('storage_capacity_factor', 1.0))))
+                    capacity_factor = max(0.0, min(1.0, float(metrics.get('storage_capacity_factor', 0.0))))
                     disk_scarcity = (1.0 - capacity_factor) / max(capacity_factor, 1e-9)
                     available_memory = available_physical_memory_bytes()
                     estimated_memory = self.estimated_transition_bytes * (len(self.memory) + len(self.training_queue))
@@ -12747,16 +12847,17 @@ class Brain:
                         capacity = 24 if backlog > 24 else 8
                         replay_count = 12
                     metrics = self.storage_metrics_snapshot()
-                    capacity_factor = max(0.0, min(1.0, float(metrics.get('storage_capacity_factor', 1.0))))
+                    capacity_factor = max(0.0, min(1.0, float(metrics.get('storage_capacity_factor', 0.0))))
                     disk_scarcity = (1.0 - capacity_factor) / max(capacity_factor, 1e-9)
                     available_memory = available_physical_memory_bytes()
                     estimated_memory = self.estimated_transition_bytes * (len(self.memory) + len(self.training_queue))
                     memory_pressure = (estimated_memory / (estimated_memory + available_memory)
                                        if available_memory is not None and estimated_memory + available_memory > 0 else 0.0)
                     memory_scarcity = memory_pressure / max(1.0 - memory_pressure, 1e-9)
-                    pressure = max(self.vision_cost_ema / 0.38, self.training_cost_ema / 0.65,
-                                   self.capture_wait_ema / 0.34, self.decision_cost_ema / 0.36,
-                                   disk_scarcity, memory_scarcity)
+                    load = system_cpu_load()
+                    cpu_scarcity = (float(load) / max(1.0 - float(load), 1e-9)
+                                    if load is not None and math.isfinite(float(load)) else 0.0)
+                    pressure = max(disk_scarcity, memory_scarcity, cpu_scarcity)
                     if pressure > 1.0:
                         scale = min(1.0, 1.0 / pressure)
                         capacity = max(1, int(capacity * scale))
@@ -13560,7 +13661,7 @@ class Brain:
 
 def frame_response_metrics(before, after, targets=()):
     if before is None or after is None or len(before) != W * H * 4 or len(after) != W * H * 4:
-        return {'global': 0.0, 'region_peak': 0.0, 'focused': 0.0, 'active_regions': 0}
+        return {'global': 0.0, 'region_peak': 0.0, 'focused': 0.0, 'active_regions': 0, 'region_count': 12}
     amounts = [0.0] * 12
     counts = [0] * 12
     for y in range(3, H, 8):
@@ -13600,9 +13701,11 @@ def frame_response_metrics(before, after, targets=()):
                 total += abs(before[index] - after[index]) + abs(before[index + 1] - after[index + 1]) + abs(before[index + 2] - after[index + 2])
                 count += 1
         focused = max(focused, total / max(1, count * 765))
-    return {'global': round(sum(amounts) / max(1, sum(counts)), 6),
-            'region_peak': round(max(means), 6), 'focused': round(focused, 6),
-            'active_regions': sum(value >= 0.075 for value in means)}
+    global_change = round(sum(amounts) / max(1, sum(counts)), 6)
+    active_regions = sum(value >= max(1.0 / 765.0, global_change * 0.5) for value in means)
+    return {'global': global_change, 'region_peak': round(max(means), 6),
+            'focused': round(focused, 6), 'active_regions': active_regions,
+            'region_count': len(means)}
 
 
 class GameAgent:
@@ -13645,6 +13748,7 @@ class GameAgent:
         self.errors = deque(maxlen=30)
         self.brain = None
         self.capture = None
+        self.focus_recovery_active = False
         self.listener = None
         self.guardian = StopGuardian(stop_vk, self.stop_gate, self.stop_event,
                                      consume_stop_key=self.operation != 'cultivate')
@@ -14173,6 +14277,7 @@ class GameAgent:
             if not capture_owned:
                 return
             local_capture = Capture(self.native, self.mode, self.own_hwnd, self.target_hwnd, self.target_identity)
+            local_capture.stop_event = self.stop_event
             if self.mode == '窗口' and self.target_identity is None and local_capture.target is None and self.window_hint is not None:
                 if self.native.user.IsWindow(self.window_hint):
                     identity = local_capture._window_identity(self.window_hint)
@@ -14227,6 +14332,7 @@ class GameAgent:
                             signature, pid, hwnd = local_capture.target_signature, local_capture.target_pid, local_capture.target
                             local_capture.close()
                             local_capture = Capture(self.native, self.mode, self.own_hwnd, self.target_hwnd, self.target_identity)
+                            local_capture.stop_event = self.stop_event
                             if local_capture.target_signature is None:
                                 local_capture.target_signature = signature
                                 local_capture.target_pid = pid
@@ -14395,11 +14501,19 @@ class GameAgent:
             return 'stop_listener_unhealthy'
         if self.operation == 'agent' and self.externally_supervised and (self.listener is None or not self.listener.healthy()):
             return 'stop_listener_unhealthy'
-        if self.capture_is_stale():
-            return 'capture_stale'
         capture = getattr(self, 'capture', None)
-        if self.mode == '窗口' and capture is not None and not capture.is_target_focused():
-            return 'focus_lost'
+        if self.mode == '窗口' and capture is not None:
+            if not capture.is_target_focused():
+                self.focus_recovery_active = True
+            if not capture.ensure_target_focus():
+                return 'stop_key' if self.stop_event.is_set() else 'focus_lost'
+        if self.capture_is_stale():
+            if self.focus_recovery_active and not self.stop_event.is_set():
+                with self.sensor_condition:
+                    self.sensor_condition.wait(0.05)
+                return True
+            return 'capture_stale'
+        self.focus_recovery_active = False
         if self.operation == 'agent' and not self.physical_input_tracking_available:
             return True
         if self.operation == 'agent' and self.physical_input_tracking_available:
@@ -14420,13 +14534,20 @@ class GameAgent:
         points.extend(old.attention_points[:5])
         points.extend(old.ui_text[:3])
         response = frame_response_metrics(old.raw, frame[0], points)
-        natural = max(0.0, float(old.change), self.brain.game.passive_change if self.brain is not None else 0.0)
-        wide = response['global'] > max(0.23, min(0.55, 0.29 + natural * 1.5))
-        local_threshold = max(0.12, min(0.40, 0.085 + natural * 2.0))
-        local = (response['region_peak'] >= local_threshold
-                 and response['region_peak'] >= response['global'] * 1.9)
-        focused = (response['focused'] >= max(0.14, min(0.42, 0.085 + natural * 2.2))
-                   and response['focused'] >= response['global'] * 1.6)
+        game = self.brain.game if self.brain is not None else None
+        natural = max(0.0, float(old.change), float(game.passive_change) if game is not None else 0.0)
+        controller = getattr(self, 'controller', None)
+        action_started = getattr(controller, 'action_first_input_at', None) if controller is not None else None
+        elapsed = max(0.0, float(frame[2]) - float(action_started)) if isinstance(action_started, (int, float)) else 0.0
+        thresholds = adaptive_visual_thresholds(game, natural, elapsed, len(points))
+        region_factor = response['region_count'] / max(1, response['active_regions'])
+        wide = response['global'] > thresholds['global'] * region_factor
+        local_factor = math.sqrt(region_factor)
+        local = (response['region_peak'] >= thresholds['regional']
+                 and response['region_peak'] >= response['global'] * local_factor)
+        focused_factor = math.sqrt(response['region_count'] / max(1, min(response['region_count'], len(points))))
+        focused = (response['focused'] >= thresholds['focused']
+                   and response['focused'] >= response['global'] * focused_factor)
         self.monitor_candidate_sequence = frame[3]
         if wide:
             residual, displacement, camera_evidence = camera_frame_alignment(old.raw, frame[0])
@@ -14752,7 +14873,8 @@ class GameAgent:
                         self.brain.store_problem = None
                     self.note_stage_cost('cultivation', time.perf_counter() - started)
                     self.safe_status()
-                    self.stop_event.wait(0.12)
+                    wait_duration = max(0.001, self.brain.storage_cost_ema, self.brain.training_cost_ema, time.perf_counter() - started)
+                    self.stop_event.wait(wait_duration)
                 except Exception as exc:
                     self.phase = 'recovering'
                     self.error(exc)
@@ -14901,7 +15023,7 @@ class GameAgent:
                         model_parameters = self.brain.parameter_dictionary(parameters, action, self.brain.stagnation)
                         self.last_decision = self.brain.decision_diagnostics(
                             obs, index, model_parameters, len(chosen_plan), expected_state is not None)
-                        self.controller.guard = self.capture.is_target_focused if self.capture is not None else None
+                        self.controller.guard = self.capture.ensure_target_focus if self.capture is not None else None
                         self.drain_agent_physical_events()
                         with self.physical_input_lock:
                             pre_action_input_generation = self.physical_input_generation
@@ -15389,10 +15511,11 @@ def validate_learning_backend(module):
     return True
 
 
-def acceleration_for(folder, status):
-    cache_path = pathlib.Path(folder).resolve() / 'cupy_cache'
-    cache_path.mkdir(parents=True, exist_ok=True)
-    os.environ['CUPY_CACHE_DIR'] = str(cache_path)
+def acceleration_for(folder, status, allow_gpu=True):
+    if allow_gpu:
+        cache_path = pathlib.Path(folder).resolve() / 'cupy_cache'
+        cache_path.mkdir(parents=True, exist_ok=True)
+        os.environ['CUPY_CACHE_DIR'] = str(cache_path)
     def verified_cpu(module):
         try:
             x = module.asarray([[0.1] * FEATURE_COUNT, [0.2] * FEATURE_COUNT], dtype=module.float32)
@@ -15451,6 +15574,9 @@ def acceleration_for(folder, status):
     if cpu is None:
         status('使用内置计算后端')
         return None
+    if not allow_gpu:
+        status('本机 CPU 计算后端就绪')
+        return cpu
     gpu = gpu_backend()
     if gpu is None:
         status('本机 CPU 计算后端就绪')
@@ -16163,7 +16289,7 @@ def verify_learning_upgrades(agent, observation):
     dummy = object.__new__(Brain)
     dummy.game_key = 'synthetic'
     dummy.games = {'synthetic': game}
-    dummy.outcome_trace = deque(maxlen=LONG_GOAL_HORIZON)
+    dummy.outcome_trace = deque(maxlen=agent.memory.maxlen)
     dummy.terminal_credit_samples = 0
     dummy.reward_info = {}
     retained = []
@@ -16666,7 +16792,7 @@ def verify_agent_improvement_regressions(agent, observation):
     dummy = Brain.__new__(Brain)
     dummy.game_key = 'synthetic'
     dummy.games = {'synthetic': trial}
-    dummy.outcome_trace = deque(maxlen=LONG_GOAL_HORIZON)
+    dummy.outcome_trace = deque(maxlen=agent.memory.maxlen)
     dummy.terminal_credit_samples = 0
     dummy.reward_info = {}
     retained = []
@@ -17125,8 +17251,8 @@ def verify_v20_regressions(agent, observation):
     gate = StopKeyGate(fake, agent.stop_vk, stopped)
     gate.prefer_trusted_sources(True)
     device.value = 0x8000
-    assert not gate.poll() and not stopped.is_set()
-    assert gate.observe(True) and stopped.is_set()
+    assert gate.poll() and stopped.is_set()
+    assert not gate.observe(True) and stopped.is_set()
     assert not gate.observe(True, physical=False) and stopped.is_set()
     assert not gate.observe(True, physical=True) and stopped.is_set()
     class SyntheticKeyboard:
@@ -17446,6 +17572,12 @@ local_frame = bytes(local_frame)
 regions = engine.frame_response_metrics(base_frame, local_frame, [(0.29, 0.29)])
 assert regions['focused'] > 0.20 and regions['focused'] > regions['global'] * 2
 assert regions['region_peak'] > regions['global'] * 3
+assert regions['region_count'] == 12
+adaptive_game = type('AdaptiveGame', (), {'passive_change': 0.003,
+    'passive_timed': {'scene': [0.02, 0.0001, 8, 0.10]}})()
+adaptive = engine.adaptive_visual_thresholds(adaptive_game, 0.003, 0.20, 3)
+assert 0.0 < adaptive['global'] <= adaptive['regional'] <= 1.0
+assert adaptive['global'] <= adaptive['focused'] <= 1.0
 pattern = bytearray(engine.W * engine.H * 4)
 shifted = bytearray(len(pattern))
 for row in range(engine.H):
@@ -17478,6 +17610,24 @@ cap._candidate_is_game_like = lambda selected: False
 cap._candidate_visual_evidence = lambda hwnd: False
 for _ in range(7):
     assert not cap._stable_window_candidate((100, 42, (9001, 'generic', '', 'ordinary window')), 0.0)
+focus_user = type('FocusUser', (), {
+    'foreground': 7,
+    'IsWindow': lambda self, hwnd: hwnd == 42,
+    'IsIconic': lambda self, hwnd: False,
+    'GetForegroundWindow': lambda self: self.foreground,
+    'ShowWindow': lambda self, hwnd, command: 1,
+    'BringWindowToTop': lambda self, hwnd: 1,
+    'SetForegroundWindow': lambda self, hwnd: setattr(self, 'foreground', hwnd) or 1,
+})()
+focus_capture = engine.Capture.__new__(engine.Capture)
+focus_capture.mode = '窗口'
+focus_capture.activate_target = True
+focus_capture.stop_event = engine.threading.Event()
+focus_capture.target = 42
+focus_capture.target_last_focus_attempt = 0.0
+focus_capture.n = type('FocusNative', (), {'user': focus_user})()
+focus_capture._same_target = lambda hwnd: hwnd == 42
+assert focus_capture.ensure_target_focus() and focus_user.foreground == 42
 cap._candidate_visual_evidence = lambda hwnd: True
 cap.target_candidate_since = engine.time.monotonic() - 2.5
 cap.target_candidate_count = 4
@@ -17579,6 +17729,19 @@ assert engine.worker_progress_snapshot(workspace, 'test-session', WorkerIdentity
 assert engine.worker_progress_snapshot(workspace, 'another-session', WorkerIdentity()) is None
 progress_path.unlink()
 candidate = next(v for v in (65, 66, 67, 68, 70, 71, 72) if not engine.stop_equivalent(v, stop_vk))
+class StopGateProbe:
+    def __init__(self):
+        self.events = []
+    def observe(self, pressed):
+        self.events.append(bool(pressed))
+        return bool(pressed)
+stop_gate_probe = StopGateProbe()
+assert not engine.observe_configured_stop_key(stop_gate_probe, candidate, stop_vk, True)
+assert stop_gate_probe.events == []
+assert engine.observe_configured_stop_key(stop_gate_probe, stop_vk, stop_vk, True)
+assert not engine.observe_configured_stop_key(stop_gate_probe, candidate, stop_vk, False)
+assert not engine.observe_configured_stop_key(stop_gate_probe, stop_vk, stop_vk, False)
+assert stop_gate_probe.events == [True, False]
 dispatch_probe = engine.InputDispatchTracker()
 control.on_dispatch = dispatch_probe.expected
 assert control.key(candidate, True) and control.down == {candidate}
@@ -17659,6 +17822,18 @@ monitor_agent.sensor_frame = (local_frame, old_screen.rect, engine.time.monotoni
 assert monitor_agent.action_monitor(old_screen) is True
 monitor_agent.sensor_frame = (local_frame, old_screen.rect, engine.time.monotonic(), 12)
 assert monitor_agent.action_monitor(old_screen) == 'visual_change' and monitor_agent.monitor_local_breaks == 1
+focus_recovery_capture = type('FocusRecoveryCapture', (), {
+    'is_target_focused': lambda self: False,
+    'ensure_target_focus': lambda self: True,
+})()
+monitor_agent.capture = focus_recovery_capture
+monitor_agent.focus_recovery_active = False
+monitor_agent.capture_is_stale = lambda: True
+assert monitor_agent.action_monitor(old_screen) is True
+assert monitor_agent.focus_recovery_active
+monitor_agent.capture = None
+monitor_agent.focus_recovery_active = False
+monitor_agent.capture_is_stale = lambda: False
 monitor_agent.enqueue_physical_input({'type': 'mouse_button', 'button': 'left', 'down': True, 'at': engine.time.monotonic()})
 assert monitor_agent.action_monitor(old_screen) is True and monitor_agent.action_user_interference
 monitor_agent.action_user_interference = False
@@ -17740,10 +17915,63 @@ retry_probe.folder = workspace
 retry_probe.blackbox_busy = False
 retry_probe.pending_release_controller = None
 retry_calls = []
-retry_probe.start_prepare = lambda: retry_calls.append(True)
+retry_probe.start_prepare = lambda operation=None: retry_calls.append(operation)
 retry_probe.ready = False
 retry_probe.launch('agent')
-assert retry_calls == [True]
+assert retry_calls == ['agent']
+class UiProbeUser:
+    def EnableWindow(self, hwnd, enabled):
+        return 1
+class ThreadProbe:
+    def __init__(self, target, args, name=None, daemon=None):
+        self.target, self.args, self.name, self.daemon = target, args, name, daemon
+    def start(self):
+        thread_probe_calls.append(self.args)
+thread_probe_calls = []
+preparation_probe = engine.App.__new__(engine.App)
+preparation_probe.running = False
+preparation_probe.blackbox_busy = False
+preparation_probe.folder = workspace
+preparation_probe.chosen_window = lambda: ('Game', 42, (12345, 'class', 'exe', 'title'))
+preparation_probe.chosen_stop_key = lambda: 27
+preparation_probe.runtime_profile = None
+preparation_probe.ready = False
+preparation_probe.prepared_config = None
+preparation_probe.preparing_config = None
+preparation_probe.preparing_operation = None
+preparation_probe.prepared_operation = None
+preparation_probe.pending_operation = None
+preparation_probe.preparing_upgrade_operation = None
+preparation_probe.preparing = False
+preparation_probe.controls = {number: number for number in (201, 202, 203, 204, 205, 206)}
+preparation_probe.n = type('UiProbeNative', (), {'user': UiProbeUser()})()
+preparation_probe.set_status = lambda message: None
+original_thread = engine.threading.Thread
+try:
+    engine.threading.Thread = ThreadProbe
+    preparation_probe.start_prepare('cultivate')
+finally:
+    engine.threading.Thread = original_thread
+assert preparation_probe.pending_operation == 'cultivate'
+assert preparation_probe.preparing_operation == 'cultivate'
+assert thread_probe_calls == [((42, (12345, 'class', 'exe', 'title'), 27), 'cultivate')]
+auto_launches = []
+auto_probe = engine.App.__new__(engine.App)
+auto_probe.n = type('AutoLaunchNative', (), {'user': UiProbeUser()})()
+auto_probe.controls = {number: number for number in (201, 202, 203, 204, 205, 206)}
+auto_probe.folder = workspace
+auto_probe.chosen_window = lambda: ('Game', 42, (12345, 'class', 'exe', 'title'))
+auto_probe.running = False
+auto_probe.preparing = False
+auto_probe.blackbox_busy = False
+auto_probe.pending_release_controller = None
+auto_probe.stop_event = None
+auto_probe.pending_operation = 'agent'
+auto_probe.preparing_upgrade_operation = None
+auto_probe.ready = True
+auto_probe.launch = lambda operation: auto_launches.append(operation)
+assert auto_probe.window_proc(1, engine.WM_APP_READY, 0, 0) == 0
+assert auto_launches == ['agent'] and auto_probe.pending_operation is None
 legacy_keys, legacy_mouse, legacy_touch = engine.normalize_input_ledger(
     {'build': 'older-build', 'keys': [65, 27, 0], 'mouse': [engine.MOUSEEVENTF_LEFTDOWN], 'touch': []}, 27)
 assert legacy_keys == {65, 27} and legacy_mouse == {engine.MOUSEEVENTF_LEFTDOWN} and not legacy_touch
@@ -17779,6 +18007,9 @@ finally:
     store.close()
 resource_snapshot = engine.storage_resource_snapshot(workspace)
 assert 0.0 <= resource_snapshot['storage_capacity_factor'] <= 1.0
+assert resource_snapshot['persistent_data_bytes'] >= 0
+if resource_snapshot['disk_total_bytes'] and resource_snapshot['disk_free_bytes'] is not None:
+    assert abs(resource_snapshot['storage_capacity_factor'] - resource_snapshot['disk_free_bytes'] / resource_snapshot['disk_total_bytes']) < 1e-9
 agent = engine.Brain(workspace, stop_vk, numeric)
 try:
     resource_metrics = agent.refresh_storage_metrics()
@@ -18028,6 +18259,13 @@ finally:
     restored.close()
 inspection = engine.inspect_checkpoint_bundle(workspace)
 assert inspection['restores_latest'] and inspection['base_step'] >= 1
+assert inspection['snapshot_data'] and all(isinstance(value, bytes) for value in inspection['snapshot_data'].values())
+snapshot_copy = dict(inspection['snapshot_data'])
+for checkpoint_file in inspection['files']:
+    original_bytes = checkpoint_file.read_bytes()
+    checkpoint_file.write_bytes(b'changed_after_snapshot')
+    assert snapshot_copy[checkpoint_file.name] == original_bytes
+    checkpoint_file.write_bytes(original_bytes)
 class DesktopNative:
     def desktop(self):
         return workspace
@@ -18153,12 +18391,15 @@ def inspect_checkpoint_bundle(folder):
     primary = folder / 'learning_state.json.gz'
     backup = folder / 'learning_state.json.gz.bak'
     delta_path = folder / 'learning_delta.json.gz'
-    result = {'files': [], 'restores_latest': False, 'delta_present': delta_path.exists(),
+    result = {'files': [], 'snapshot_data': {}, 'restores_latest': False, 'delta_present': delta_path.exists(),
               'delta_valid': False, 'backup_used': False, 'error': None, 'base_step': None, 'latest_step': None}
     def inspect(path, compressed_limit, expanded_limit):
         if path.stat().st_size > compressed_limit:
             raise ValueError('学习检查点压缩容量超限')
-        with gzip.open(path, 'rb') as stream:
+        compressed = path.read_bytes()
+        if len(compressed) > compressed_limit:
+            raise ValueError('学习检查点压缩容量超限')
+        with gzip.GzipFile(fileobj=io.BytesIO(compressed), mode='rb') as stream:
             raw = stream.read(expanded_limit + 1)
         if len(raw) > expanded_limit:
             raise ValueError('学习检查点解压容量超限')
@@ -18169,29 +18410,31 @@ def inspect_checkpoint_bundle(folder):
         payload = json.dumps(data, ensure_ascii=False, separators=(',', ':'), allow_nan=False).encode('utf-8')
         if not isinstance(actual_hash, str) or hashlib.sha256(payload).hexdigest() != actual_hash:
             raise ValueError('学习检查点摘要校验失败')
-        return data, actual_hash
+        return data, actual_hash, compressed
     errors = []
     base = None
     base_hash = None
+    base_bytes = None
     chosen = None
     for candidate in (primary, backup):
         if not candidate.exists():
             continue
         try:
-            proposed, digest = inspect(candidate, 140_000_000, 260_000_000)
+            proposed, digest, compressed = inspect(candidate, 140_000_000, 260_000_000)
             if (proposed.get('format') != MODEL_FORMAT
                     or proposed.get('feature_count') != FEATURE_COUNT
                     or proposed.get('hidden_size') != MODEL_HIDDEN_SIZE
                     or not isinstance(proposed.get('action_ids'), list)):
                 raise ValueError('基础学习检查点版本不匹配')
-            base, base_hash, chosen = proposed, digest, candidate
+            base, base_hash, base_bytes, chosen = proposed, digest, compressed, candidate
             break
-        except (OSError, ValueError, TypeError, OverflowError, EOFError, gzip.BadGzipFile, json.JSONDecodeError) as exc:
+        except (OSError, ValueError, TypeError, OverflowError, EOFError, gzip.BadGzipFile, zlib.error, json.JSONDecodeError) as exc:
             errors.append(f'{candidate.name}: {type(exc).__name__}: {str(exc)[:120]}')
     if base is None:
         result['error'] = '; '.join(errors)[:300] if errors else 'base_not_found'
         return result
     result['files'] = [chosen]
+    result['snapshot_data'][chosen.name] = base_bytes
     result['backup_used'] = chosen == backup
     result['base_step'] = int(base.get('step', 0))
     result['latest_step'] = result['base_step']
@@ -18199,7 +18442,7 @@ def inspect_checkpoint_bundle(folder):
     result['restores_latest'] = not delta_path.exists() and not result['backup_used']
     if delta_path.exists():
         try:
-            delta, delta_hash = inspect(delta_path, 80_000_000, 150_000_000)
+            delta, delta_hash, delta_bytes = inspect(delta_path, 80_000_000, 150_000_000)
             if (delta.get('format') != 2 or delta.get('base_model_format') != MODEL_FORMAT
                     or delta.get('base_step') != result['base_step']
                     or delta.get('feature_count') != base.get('feature_count')
@@ -18209,11 +18452,12 @@ def inspect_checkpoint_bundle(folder):
                     or int(delta.get('step', -1)) < result['base_step']):
                 raise ValueError('增量与基础学习检查点不匹配')
             result['files'].append(delta_path)
+            result['snapshot_data'][delta_path.name] = delta_bytes
             result['latest_step'] = int(delta['step'])
             result['delta_valid'] = True
             result['delta_sha256'] = delta_hash
             result['restores_latest'] = not result['backup_used']
-        except (OSError, ValueError, TypeError, OverflowError, EOFError, gzip.BadGzipFile, json.JSONDecodeError) as exc:
+        except (OSError, ValueError, TypeError, OverflowError, EOFError, gzip.BadGzipFile, zlib.error, json.JSONDecodeError) as exc:
             errors.append(f'{delta_path.name}: {type(exc).__name__}: {str(exc)[:120]}')
             result['restores_latest'] = False
     if errors:
@@ -18475,9 +18719,11 @@ def blackbox(native, folder, agent, mode, stop_vk, window_identity=None, operati
     delta_state = folder / 'learning_delta.json.gz'
     checkpoint = inspect_checkpoint_bundle(folder)
     checkpoint_files = checkpoint['files']
-    checkpoint_total = sum(file.stat().st_size for file in checkpoint_files)
+    checkpoint_snapshot = checkpoint['snapshot_data']
+    checkpoint_total = sum(len(value) for value in checkpoint_snapshot.values())
     checkpoint_eligible = bool(checkpoint_files and checkpoint_total <= 920000)
-    manifest['checkpoint_bundle'] = {key: value for key, value in checkpoint.items() if key != 'files'}
+    manifest['checkpoint_bundle'] = {key: value for key, value in checkpoint.items()
+                                     if key not in ('files', 'snapshot_data')}
     runtime = folder / 'runtime_state.json'
     performance = folder / 'runtime_profile.json'
     supervisor = folder / 'supervisor_state.json'
@@ -18712,7 +18958,7 @@ def blackbox(native, folder, agent, mode, stop_vk, window_identity=None, operati
                 archive.writestr('last_screen.png', encode_png(last_screen))
             if include_state and checkpoint_eligible:
                 for checkpoint_file in checkpoint_files:
-                    archive.write(checkpoint_file, checkpoint_file.name)
+                    archive.writestr(checkpoint_file.name, checkpoint_snapshot[checkpoint_file.name])
             if include_excerpt and excerpt is not None:
                 archive.writestr('active_model_fp16.bin', excerpt)
                 archive.writestr('active_model_layout.json', json.dumps(excerpt_meta, ensure_ascii=False, separators=(',', ':')))
@@ -19132,6 +19378,10 @@ class App:
         self.workspace_lease = None
         self.prepared_config = None
         self.preparing_config = None
+        self.prepared_operation = None
+        self.preparing_operation = None
+        self.pending_operation = None
+        self.preparing_upgrade_operation = None
         self.window_options = []
         self.selected_window = None
         self.process_window_hwnd = 0
@@ -19272,6 +19522,10 @@ class App:
         self.folder = lease.folder / AGENT_DATA_DIR
         self.numpy = None
         self.runtime_profile = None
+        self.ready = False
+        self.prepared_config = None
+        self.prepared_operation = None
+        self.pending_operation = None
         if previous is not None:
             previous.close()
         self.n.user.SetWindowTextW(self.controls[102], str(selected))
@@ -19279,30 +19533,42 @@ class App:
         self.set_status('请选择游戏窗口')
         self.n.user.PostMessageW(self.hwnd, WM_APP_READY, 0, 0)
 
-    def start_prepare(self):
-        if self.running or self.preparing or self.blackbox_busy or self.folder is None:
+    def start_prepare(self, operation=None):
+        if operation in ('observe', 'agent', 'cultivate'):
+            self.pending_operation = operation
+        if self.running or self.blackbox_busy or self.folder is None:
             return
         selected = self.chosen_window()
         if selected is None:
+            self.pending_operation = None
             self.set_status('请选择游戏窗口')
             return
         target_hwnd, target_identity = int(selected[1]), tuple(selected[2])
         stop_vk = self.chosen_stop_key()
         configuration = (target_hwnd, target_identity, stop_vk)
-        if self.ready and self.prepared_config == configuration:
+        requested_operation = operation or self.pending_operation or 'agent'
+        needs_game_preflight = requested_operation != 'cultivate'
+        game_preflight_ready = bool(self.runtime_profile and self.runtime_profile.get('game_runtime_preflight_verified'))
+        if self.ready and self.prepared_config == configuration and (not needs_game_preflight or game_preflight_ready):
             return
-        if self.preparing and self.preparing_config == configuration:
+        if self.preparing:
+            if (self.preparing_config == configuration and requested_operation in ('observe', 'agent')
+                    and self.preparing_operation == 'cultivate'):
+                self.preparing_upgrade_operation = requested_operation
+                self.pending_operation = requested_operation
             return
         self.ready = False
         self.prepared_config = None
+        self.prepared_operation = None
         self.preparing_config = configuration
+        self.preparing_operation = requested_operation
         self.preparing = True
         for number in (202, 203, 201, 204, 205, 206):
             self.n.user.EnableWindow(self.controls[number], 0)
         self.set_status('准备中…')
-        threading.Thread(target=self.prepare, args=(configuration,), name='Preparation', daemon=True).start()
+        threading.Thread(target=self.prepare, args=(configuration, requested_operation), name='Preparation', daemon=True).start()
 
-    def prepare(self, configuration):
+    def prepare(self, configuration, operation='agent'):
         target_hwnd, target_identity, stop_vk = configuration
         try:
             self.folder.mkdir(parents=True, exist_ok=True)
@@ -19315,49 +19581,59 @@ class App:
                 raise OSError('工作目录回读失败')
             probe.unlink()
             verify_local_storage(self.folder, self.n)
-            self.numpy = acceleration_for(self.folder, self.set_status)
+            self.numpy = acceleration_for(self.folder, self.set_status, allow_gpu=operation != 'cultivate')
             validate_learning_backend(self.numpy)
-            self.set_status('验证视觉采集')
-            capture = Capture(self.n, '窗口', self.hwnd, target_hwnd, target_identity, activate_target=False)
-            try:
-                deadline = time.monotonic() + 12.0
-                while True:
-                    try:
-                        base_started = time.perf_counter()
-                        frame, rect = capture.grab()
-                        base_capture_ms = round((time.perf_counter() - base_started) * 1000.0, 3)
-                        break
-                    except OSError:
-                        if time.monotonic() >= deadline:
-                            raise
-                        time.sleep(0.10)
-                if len(frame) != W * H * 4 or rect[2] < 80 or rect[3] < 80:
-                    raise OSError('游戏窗口采集尺寸无效')
-                detail_started = time.perf_counter()
-                detail_frame = capture.grab_detail(rect, 0.5, 0.5)
-                detail_capture_ms = round((time.perf_counter() - detail_started) * 1000.0, 3)
-                if len(detail_frame) != DW * DH * 4:
-                    raise OSError('局部图像采集失败')
-                capture_ms = round((base_capture_ms + detail_capture_ms) / 2.0, 3)
-            finally:
-                capture.close()
             self.runtime_profile = {
                 'python_version': sys.version.split()[0],
                 'python_bits': ctypes.sizeof(ctypes.c_void_p) * 8,
                 'backend': getattr(self.numpy, '__name__', 'pure_python') if self.numpy is not None else 'pure_python',
-                'capture_test_milliseconds': capture_ms,
-                'capture_test_kind': 'selected_window_non_activating_preflight',
+                'capture_test_milliseconds': None,
+                'capture_test_kind': 'not_required_for_background_learning' if operation == 'cultivate' else 'selected_window_non_activating_preflight',
                 'capture_test_is_game_verified': False,
-                'game_control_requires_foreground_window': True,
-                'base_capture_milliseconds': base_capture_ms,
-                'detail_capture_milliseconds': detail_capture_ms,
-                'capture_width': int(rect[2]),
-                'capture_height': int(rect[3]),
+                'game_control_requires_foreground_window': operation != 'cultivate',
                 'feature_count': FEATURE_COUNT,
                 'action_count': len(actions_for(stop_vk)),
                 'learning_backend_verified': True,
                 'storage_backend_verified': True,
+                'preparation_operation': operation,
+                'game_runtime_preflight_verified': False,
+                'cultivation_preflight_verified': operation == 'cultivate',
             }
+            frame = None
+            rect = None
+            capture_ms = None
+            if operation != 'cultivate':
+                self.set_status('验证视觉采集')
+                capture = Capture(self.n, '窗口', self.hwnd, target_hwnd, target_identity, activate_target=False)
+                try:
+                    deadline = time.monotonic() + 12.0
+                    while True:
+                        try:
+                            base_started = time.perf_counter()
+                            frame, rect = capture.grab()
+                            base_capture_ms = round((time.perf_counter() - base_started) * 1000.0, 3)
+                            break
+                        except OSError:
+                            if time.monotonic() >= deadline:
+                                raise
+                            time.sleep(0.10)
+                    if len(frame) != W * H * 4 or rect[2] < 80 or rect[3] < 80:
+                        raise OSError('游戏窗口采集尺寸无效')
+                    detail_started = time.perf_counter()
+                    detail_frame = capture.grab_detail(rect, 0.5, 0.5)
+                    detail_capture_ms = round((time.perf_counter() - detail_started) * 1000.0, 3)
+                    if len(detail_frame) != DW * DH * 4:
+                        raise OSError('局部图像采集失败')
+                    capture_ms = round((base_capture_ms + detail_capture_ms) / 2.0, 3)
+                finally:
+                    capture.close()
+                self.runtime_profile.update({
+                    'capture_test_milliseconds': capture_ms,
+                    'base_capture_milliseconds': base_capture_ms,
+                    'detail_capture_milliseconds': detail_capture_ms,
+                    'capture_width': int(rect[2]),
+                    'capture_height': int(rect[3]),
+                })
             self.set_status('验证停止键')
             probe_listener = StopListener(self.n, stop_vk, threading.Event(), consume_stop_key=False)
             try:
@@ -19371,8 +19647,6 @@ class App:
                     raise OSError('停止键监听初始化失败')
             finally:
                 probe_listener.close()
-            verification_key = (SOURCE_BUILD, str(self.folder.resolve()),
-                                getattr(self.numpy, '__name__', 'pure_python') if self.numpy is not None else 'pure_python', stop_vk)
             backend_name = getattr(self.numpy, '__name__', 'pure_python') if self.numpy is not None else 'pure_python'
             cache_material = {'build': SOURCE_BUILD, 'python': sys.version.split()[0],
                               'backend': backend_name, 'backend_version': getattr(self.numpy, '__version__', None),
@@ -19388,18 +19662,22 @@ class App:
                         previous_profile = loaded_profile
             except (OSError, ValueError, TypeError):
                 previous_profile = {}
-            verification_key = (SOURCE_BUILD, str(self.folder.resolve()), backend_name, stop_vk, cache_key)
-            cache_hit = bool(previous_profile.get('offline_regression_verified')
-                             and previous_profile.get('offline_regression_cache_key') == cache_key)
-            if verification_key not in self.regression_verifications and not cache_hit:
-                self.set_status('验证离线学习、输入释放与恢复链路')
-                if not verify_offline_cold_start(self.folder, self.numpy, stop_vk, '窗口',
-                                                 target_hwnd, target_identity):
-                    raise OSError('离线回归验证未通过')
-                self.regression_verifications.add(verification_key)
-            self.runtime_profile['offline_regression_verified'] = True
-            self.runtime_profile['offline_regression_cache_key'] = cache_key
-            self.runtime_profile['offline_regression_cache_hit'] = cache_hit
+            if operation != 'cultivate':
+                verification_key = (SOURCE_BUILD, str(self.folder.resolve()), backend_name, stop_vk, cache_key)
+                cache_hit = bool(previous_profile.get('offline_regression_verified')
+                                 and previous_profile.get('offline_regression_cache_key') == cache_key)
+                if verification_key not in self.regression_verifications and not cache_hit:
+                    self.set_status('验证离线学习、输入释放与恢复链路')
+                    if not verify_offline_cold_start(self.folder, self.numpy, stop_vk, '窗口',
+                                                     target_hwnd, target_identity):
+                        raise OSError('离线回归验证未通过')
+                    self.regression_verifications.add(verification_key)
+                self.runtime_profile['offline_regression_verified'] = True
+                self.runtime_profile['offline_regression_cache_key'] = cache_key
+                self.runtime_profile['offline_regression_cache_hit'] = cache_hit
+            else:
+                self.runtime_profile['offline_regression_verified'] = False
+                self.runtime_profile['offline_regression_skipped_for_cultivation'] = True
             self.set_status('验证经验存储')
             try:
                 store = ReplayStore(self.folder)
@@ -19413,39 +19691,52 @@ class App:
             finally:
                 store.close()
             self.runtime_profile['experience_store_verified'] = True
-            self.set_status('测量当前设备的推理与规划性能')
-            try:
-                performance = profile_runtime(self.folder, self.numpy, capture_ms, stop_vk, (frame, rect))
-                self.runtime_profile['performance'] = performance
-                self.runtime_profile['performance_profile_verified'] = bool(
-                    performance.get('complete_plan_p95_milliseconds') is not None
-                    and performance.get('estimated_single_decision_milliseconds') is not None)
-            except BaseException as exc:
+            if operation != 'cultivate':
+                self.set_status('测量当前设备的推理与规划性能')
+                try:
+                    performance = profile_runtime(self.folder, self.numpy, capture_ms, stop_vk, (frame, rect))
+                    self.runtime_profile['performance'] = performance
+                    self.runtime_profile['performance_profile_verified'] = bool(
+                        performance.get('complete_plan_p95_milliseconds') is not None
+                        and performance.get('estimated_single_decision_milliseconds') is not None)
+                except BaseException as exc:
+                    self.runtime_profile['performance_profile_verified'] = False
+                    self.runtime_profile['performance_profile_error'] = f'{type(exc).__name__}: {str(exc)[:180]}'
+                self.runtime_profile['runtime_budget_source'] = 'measured_stage_costs_and_device_profile'
+                self.runtime_profile['game_runtime_preflight_verified'] = True
+                self.runtime_profile['input_dispatch_measurement'] = 'windows_low_level_hook_observation_not_game_receipt'
+            else:
                 self.runtime_profile['performance_profile_verified'] = False
-                self.runtime_profile['performance_profile_error'] = f'{type(exc).__name__}: {str(exc)[:180]}'
-            self.runtime_profile['runtime_budget_source'] = 'measured_stage_costs_and_device_profile'
+                self.runtime_profile['performance_profile_skipped_for_cultivation'] = True
+                self.runtime_profile['runtime_budget_source'] = 'measured_cpu_backend_and_storage_validation'
+                self.runtime_profile['input_dispatch_measurement'] = 'not_applicable_to_background_learning'
             self.runtime_profile['storage_resource_metrics'] = storage_resource_snapshot(self.folder)
-            self.runtime_profile['input_dispatch_measurement'] = 'windows_low_level_hook_observation_not_game_receipt'
-            profile = self.folder / 'runtime_profile.json'
             temporary = self.folder / 'runtime_profile.json.tmp'
             with temporary.open('w', encoding='utf-8') as stream:
                 json.dump(self.runtime_profile, stream, ensure_ascii=False, separators=(',', ':'), allow_nan=False)
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(temporary, profile)
+            os.replace(temporary, profile_path)
             self.prepared_config = configuration
+            self.prepared_operation = operation
             self.ready = True
             notices = []
             if not self.runtime_profile.get('stop_key_interception_capable'):
                 notices.append('停止键使用备用检测通道')
-            if not self.runtime_profile.get('physical_input_tracking_preflight'):
+            if operation != 'cultivate' and not self.runtime_profile.get('physical_input_tracking_preflight'):
                 notices.append('物理输入来源监测不可用，学习反馈将安全停用')
-            self.set_status('一切就绪' if not notices else '已就绪；' + '；'.join(notices))
+            if operation == 'cultivate':
+                self.set_status('学习环境就绪' if not notices else '学习环境就绪；' + '；'.join(notices))
+            else:
+                self.set_status('一切就绪' if not notices else '已就绪；' + '；'.join(notices))
         except BaseException as exc:
             self.ready = False
+            self.prepared_config = None
+            self.prepared_operation = None
             self.set_status(f'准备失败：{str(exc)[:150]}')
         finally:
             self.preparing = False
+            self.preparing_operation = None
             self.n.user.PostMessageW(self.hwnd, WM_APP_READY, 0, 0)
 
     def launch(self, operation):
@@ -19454,7 +19745,7 @@ class App:
         if self.running or not self.folder or self.blackbox_busy or self.pending_release_controller is not None:
             return
         if not self.ready:
-            self.start_prepare()
+            self.start_prepare(operation)
             return
         try:
             selected = self.chosen_window()
@@ -19464,8 +19755,10 @@ class App:
             target_hwnd, target_identity = int(selected[1]), tuple(selected[2])
             stop_vk = self.chosen_stop_key()
             configuration = (target_hwnd, target_identity, stop_vk)
-            if configuration != self.prepared_config:
-                self.start_prepare()
+            full_preflight_missing = (operation in ('observe', 'agent')
+                                      and not bool(self.runtime_profile and self.runtime_profile.get('game_runtime_preflight_verified')))
+            if configuration != self.prepared_config or full_preflight_missing:
+                self.start_prepare(operation)
                 return
             current_window = next((item for item in enumerate_windows(self.n, self.hwnd) if item[1] == target_hwnd), None)
             if (current_window is None or current_window[2][0] != target_identity[0]
@@ -19913,7 +20206,11 @@ class App:
                     if number == 202:
                         self.selected_window = self.chosen_window()
                     if not self.running and not self.preparing and self.folder is not None:
-                        self.start_prepare()
+                        self.ready = False
+                        self.prepared_config = None
+                        self.prepared_operation = None
+                        self.set_status('配置已更新，选择功能开始')
+                        self.n.user.PostMessageW(self.hwnd, WM_APP_READY, 0, 0)
                     return 0
                 if notification == 0 and number == 102:
                     self.choose_folder()
@@ -19955,6 +20252,16 @@ class App:
                 stop_pending = bool(self.stop_event is not None and self.stop_event.is_set())
                 can_export = self.folder is not None and not self.preparing and not self.blackbox_busy and not stop_pending
                 self.n.user.EnableWindow(self.controls[206], int(can_export))
+                if not self.preparing and self.preparing_upgrade_operation is not None:
+                    upgrade = self.preparing_upgrade_operation
+                    self.preparing_upgrade_operation = None
+                    self.start_prepare(upgrade)
+                    return 0
+                if not self.preparing and self.pending_operation is not None:
+                    pending = self.pending_operation
+                    self.pending_operation = None
+                    if self.ready and not self.running and self.pending_release_controller is None:
+                        self.launch(pending)
                 return 0
             if msg == WM_APP_STOP_REQUESTED:
                 for number in (201, 202, 203, 204, 205, 206):
