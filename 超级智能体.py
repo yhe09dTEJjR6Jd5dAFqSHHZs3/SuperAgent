@@ -24,7 +24,7 @@ import uuid
 import urllib.parse
 import zipfile
 import zlib
-from collections import OrderedDict, deque
+from collections import Counter, OrderedDict, deque
 
 W, H, GW, GH, FEATURE_COUNT = 320, 180, 20, 12, 544
 MODEL_FORMAT, MODEL_HIDDEN_SIZE = 24, 128
@@ -88,6 +88,32 @@ def available_physical_memory_bytes():
         return value if value > 0 else None
     except Exception:
         return None
+
+
+def storage_resource_snapshot(folder):
+    path = pathlib.Path(folder)
+    try:
+        usage = shutil.disk_usage(path)
+        total = int(usage.total)
+        free = int(usage.free)
+    except (OSError, ValueError, TypeError):
+        total = None
+        free = None
+    names = ('experience.sqlite3', 'experience.sqlite3-wal', 'experience.sqlite3-shm',
+             'experience_overflow.jsonl', 'learning_state.json.gz', 'learning_delta.json.gz',
+             'runtime_state.json', 'runtime_profile.json')
+    persistent = 0
+    for name in names:
+        try:
+            persistent += (path / name).stat().st_size
+        except OSError:
+            pass
+    factor = (free / (free + persistent) if free is not None and free + persistent > 0 else
+              1.0 if free is None else 0.0)
+    return {'disk_total_bytes': total, 'disk_free_bytes': free,
+            'persistent_data_bytes': persistent,
+            'disk_free_fraction': free / total if free is not None and total else None,
+            'storage_capacity_factor': max(0.0, min(1.0, factor))}
 
 
 def system_cpu_load():
@@ -805,8 +831,9 @@ def physical_virtual_key(vk, scan, flags):
     return vk
 
 
-SYSTEM_RESERVED_KEYS = frozenset((0x5B, 0x5C, 0x5D, 0x5F, 0x91, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5,
-                                  0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD, 0xAE, 0xAF,
+SYSTEM_RESERVED_KEYS = frozenset((0x03, 0x13, 0x14, 0x2C, 0x2D, 0x5B, 0x5C, 0x5D, 0x5F,
+                                  0x90, 0x91, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB, 0xAC,
+                                  0xAD, 0xAE, 0xAF,
                                   0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6, 0xB7))
 
 
@@ -846,7 +873,7 @@ def normalize_input_ledger(state, stop_vk):
     for value in keys_data:
         if not isinstance(value, int) or isinstance(value, bool):
             raise ValueError('输入状态记录包含无效键值')
-        if safe_game_key(value) and not stop_equivalent(value, stop_vk):
+        if 1 <= value <= 0xFE:
             keys.add(int(value))
     mouse = set()
     allowed_mouse = (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_MIDDLEDOWN)
@@ -890,13 +917,13 @@ def system_shortcut(keys):
     has_shift = bool(values.intersection((16, 160, 161)))
     if values.intersection((0x5B, 0x5C, 0x5D)):
         return True
-    if has_alt and values.intersection((9, 27, 32, 36, 37, 39, 115)):
+    if has_alt and values.intersection((9, 27, 32, 36, 37, 38, 39, 40, 115)):
         return True
-    if has_ctrl and values.intersection((27, 68, 69, 76, 78, 82, 84, 87)):
+    if has_ctrl and values.intersection((27, 68, 69, 76, 78, 82, 84, 87, 115)):
         return True
     if has_ctrl and has_alt and 46 in values:
         return True
-    if has_ctrl and has_shift and 27 in values:
+    if has_ctrl and has_shift and values.intersection((27, 78, 87)):
         return True
     return False
 
@@ -1093,16 +1120,19 @@ def run_stop_watch(vk, parent_pid, consume_stop_key=True):
 
 
 class StopListener:
-    def __init__(self, native, stop_vk, stop_event, gate=None, input_callback=None, target_pid=None, target_hwnd=None, consume_stop_key=True):
+    def __init__(self, native, stop_vk, stop_event, gate=None, input_callback=None, target_pid=None, target_hwnd=None, consume_stop_key=True, injected_callback=None):
         self.native = native
         self.stop_vk = stop_vk
         self.stop_event = stop_event
         self.gate = gate if gate is not None else StopKeyGate(native, stop_vk, stop_event)
         self.input_callback = input_callback
+        self.injected_callback = injected_callback
         self.consume_stop_key = bool(consume_stop_key)
         self.target_pid = int(target_pid or 0)
         self.target_hwnd = int(target_hwnd or 0)
         self.physical_keys_down = set()
+        self.physical_mouse_down = set()
+        self.physical_state_lock = threading.Lock()
         self.last_mouse_move_tick = 0.0
         self.last_mouse_position = None
         self.target_was_foreground = False
@@ -1151,6 +1181,14 @@ class StopListener:
         except Exception:
             pass
 
+    def emit_injected(self, event):
+        if self.injected_callback is None or self.ending.is_set():
+            return
+        try:
+            self.injected_callback(event)
+        except Exception:
+            pass
+
     def start(self):
         self.poll_thread.start()
         self.thread.start()
@@ -1183,6 +1221,10 @@ class StopListener:
 
     def interception_healthy(self):
         return bool(self.consume_stop_key and self.gate.allow_local_press and self.interception_capable())
+
+    def physical_state_snapshot(self):
+        with self.physical_state_lock:
+            return set(self.physical_keys_down), set(self.physical_mouse_down)
 
     def poll_healthy(self):
         return (self.poll_thread.is_alive() and self.poll_ready.is_set() and self.gate.poll_accessible
@@ -1223,11 +1265,17 @@ class StopListener:
                         if injected:
                             if stop_equivalent(physical_vk, self.stop_vk):
                                 self.gate.note_injected(pressed)
+                            elif (self.injected_callback is not None and int(info.dwExtraInfo) == os.getpid()
+                                  and (pressed or released) and self.target_is_foreground()):
+                                self.emit_injected({'type': 'key', 'vk': int(physical_vk), 'down': bool(pressed),
+                                                    'at': time.monotonic()})
                             return self.native.user.CallNextHookEx(hook, code, wp, lp)
-                        if pressed:
-                            self.physical_keys_down.add(physical_vk)
-                        elif released:
-                            self.physical_keys_down.discard(physical_vk)
+                        if pressed or released:
+                            with self.physical_state_lock:
+                                if pressed:
+                                    self.physical_keys_down.add(physical_vk)
+                                else:
+                                    self.physical_keys_down.discard(physical_vk)
                         if stop_equivalent(physical_vk, self.stop_vk):
                             if not self.gate.allow_local_press:
                                 return self.native.user.CallNextHookEx(hook, code, wp, lp)
@@ -1251,36 +1299,67 @@ class StopListener:
 
             def mouse(code, wp, lp):
                 try:
-                    if code >= 0 and self.input_callback is not None and self.target_is_foreground():
+                    if code >= 0:
                         info = ctypes.cast(lp, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
-                        if not (info.flags & 0x01):
-                            now = time.monotonic()
-                            x, y = int(info.pt.x), int(info.pt.y)
-                            if wp == WM_MOUSEMOVE:
-                                if (self.last_mouse_position != (x, y)
-                                        and now - self.last_mouse_move_tick >= 0.02):
-                                    self.last_mouse_move_tick = now
-                                    self.last_mouse_position = (x, y)
-                                    self.emit_input({'type': 'mouse_move', 'x': x, 'y': y, 'at': now})
-                            elif wp in (WM_LBUTTONDOWN, WM_LBUTTONUP, WM_RBUTTONDOWN, WM_RBUTTONUP,
-                                        WM_MBUTTONDOWN, WM_MBUTTONUP, WM_XBUTTONDOWN, WM_XBUTTONUP):
+                        injected = bool(info.flags & 0x01)
+                        if injected:
+                            if (self.injected_callback is None or int(info.dwExtraInfo) != os.getpid()
+                                    or not self.target_is_foreground()):
+                                return self.native.user.CallNextHookEx(mouse_hook, code, wp, lp)
+                        else:
+                            if wp in (WM_LBUTTONDOWN, WM_LBUTTONUP, WM_RBUTTONDOWN, WM_RBUTTONUP,
+                                      WM_MBUTTONDOWN, WM_MBUTTONUP, WM_XBUTTONDOWN, WM_XBUTTONUP):
                                 if wp in (WM_LBUTTONDOWN, WM_LBUTTONUP):
-                                    button = 'left'
+                                    physical_button = 'left'
                                 elif wp in (WM_RBUTTONDOWN, WM_RBUTTONUP):
-                                    button = 'right'
+                                    physical_button = 'right'
                                 elif wp in (WM_MBUTTONDOWN, WM_MBUTTONUP):
-                                    button = 'middle'
+                                    physical_button = 'middle'
                                 else:
-                                    button = 'x' + str((int(info.mouseData) >> 16) & 0xFFFF)
-                                self.emit_input({'type': 'mouse_button', 'button': button,
-                                                 'down': wp in (WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MBUTTONDOWN, WM_XBUTTONDOWN),
-                                                 'x': x, 'y': y, 'at': now})
-                            elif wp in (WM_MOUSEWHEEL, WM_MOUSEHWHEEL):
-                                delta = ctypes.c_short((int(info.mouseData) >> 16) & 0xFFFF).value
-                                if delta:
-                                    self.emit_input({'type': 'mouse_wheel', 'horizontal': wp == WM_MOUSEHWHEEL,
-                                                     'direction': 1 if delta > 0 else -1,
-                                                     'x': x, 'y': y, 'at': now})
+                                    physical_xbutton = (int(info.mouseData) >> 16) & 0xFFFF
+                                    physical_button = 'x1' if physical_xbutton == 1 else 'x2' if physical_xbutton == 2 else 'x' + str(physical_xbutton)
+                                with self.physical_state_lock:
+                                    if wp in (WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MBUTTONDOWN, WM_XBUTTONDOWN):
+                                        self.physical_mouse_down.add(physical_button)
+                                    else:
+                                        self.physical_mouse_down.discard(physical_button)
+                            if self.input_callback is None or not self.target_is_foreground():
+                                return self.native.user.CallNextHookEx(mouse_hook, code, wp, lp)
+                        now = time.monotonic()
+                        x, y = int(info.pt.x), int(info.pt.y)
+                        emit = self.emit_injected if injected else self.emit_input
+                        if wp == WM_MOUSEMOVE:
+                            if injected:
+                                emit({'type': 'mouse_move', 'at': now})
+                            elif (self.last_mouse_position != (x, y) and now - self.last_mouse_move_tick >= 0.02):
+                                self.last_mouse_move_tick = now
+                                self.last_mouse_position = (x, y)
+                                emit({'type': 'mouse_move', 'x': x, 'y': y, 'at': now})
+                        elif wp in (WM_LBUTTONDOWN, WM_LBUTTONUP, WM_RBUTTONDOWN, WM_RBUTTONUP,
+                                    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_XBUTTONDOWN, WM_XBUTTONUP):
+                            if wp in (WM_LBUTTONDOWN, WM_LBUTTONUP):
+                                button = 'left'
+                            elif wp in (WM_RBUTTONDOWN, WM_RBUTTONUP):
+                                button = 'right'
+                            elif wp in (WM_MBUTTONDOWN, WM_MBUTTONUP):
+                                button = 'middle'
+                            else:
+                                xbutton = (int(info.mouseData) >> 16) & 0xFFFF
+                                button = 'x1' if xbutton == 1 else 'x2' if xbutton == 2 else 'x' + str(xbutton)
+                            event = {'type': 'mouse_button', 'button': button,
+                                     'down': wp in (WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MBUTTONDOWN, WM_XBUTTONDOWN),
+                                     'at': now}
+                            if not injected:
+                                event.update({'x': x, 'y': y})
+                            emit(event)
+                        elif wp in (WM_MOUSEWHEEL, WM_MOUSEHWHEEL):
+                            delta = ctypes.c_short((int(info.mouseData) >> 16) & 0xFFFF).value
+                            if delta:
+                                event = {'type': 'mouse_wheel', 'horizontal': wp == WM_MOUSEHWHEEL,
+                                         'direction': 1 if delta > 0 else -1, 'at': now}
+                                if not injected:
+                                    event.update({'x': x, 'y': y})
+                                emit(event)
                 except Exception:
                     pass
                 return self.native.user.CallNextHookEx(mouse_hook, code, wp, lp)
@@ -1306,10 +1385,11 @@ class StopListener:
                                         if (self.input_callback is not None and not self.registered_channels.get('hook')
                                                 and safe_game_key(vk) and not stop_equivalent(vk, self.stop_vk)
                                                 and self.target_is_foreground()):
-                                            if pressed:
-                                                self.physical_keys_down.add(vk)
-                                            else:
-                                                self.physical_keys_down.discard(vk)
+                                            with self.physical_state_lock:
+                                                if pressed:
+                                                    self.physical_keys_down.add(vk)
+                                                else:
+                                                    self.physical_keys_down.discard(vk)
                                             self.emit_input({'type': 'key', 'vk': int(vk), 'down': bool(pressed),
                                                              'at': time.monotonic()})
                     except Exception:
@@ -2255,6 +2335,65 @@ class Capture:
             setattr(self, name, None)
 
 
+class InputDispatchTracker:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.expected_pending = Counter()
+        self.observed_pending = Counter()
+        self.expected_total = 0
+        self.observed_total = 0
+        self.matched_total = 0
+
+    @staticmethod
+    def signature(event):
+        if not isinstance(event, dict):
+            return None
+        kind = event.get('type')
+        if kind == 'key':
+            return kind, int(event.get('vk', 0)), bool(event.get('down'))
+        if kind == 'mouse_button':
+            return kind, str(event.get('button', '')), bool(event.get('down'))
+        if kind == 'mouse_wheel':
+            direction = int(event.get('direction', 0))
+            return (kind, bool(event.get('horizontal')), 1 if direction > 0 else -1) if direction else None
+        if kind == 'mouse_move':
+            return (kind,)
+        return None
+
+    def expected(self, event):
+        signature = self.signature(event)
+        if signature is None:
+            return False
+        with self.lock:
+            self.expected_total += 1
+            if self.observed_pending[signature]:
+                self.observed_pending[signature] -= 1
+                self.matched_total += 1
+            else:
+                self.expected_pending[signature] += 1
+        return True
+
+    def observed(self, event):
+        signature = self.signature(event)
+        if signature is None:
+            return False
+        with self.lock:
+            self.observed_total += 1
+            if self.expected_pending[signature]:
+                self.expected_pending[signature] -= 1
+                self.matched_total += 1
+            else:
+                self.observed_pending[signature] += 1
+        return True
+
+    def snapshot(self):
+        with self.lock:
+            return {'expected': self.expected_total, 'observed': self.observed_total,
+                    'matched': self.matched_total,
+                    'pending_expected': sum(self.expected_pending.values()),
+                    'pending_observed': sum(self.observed_pending.values())}
+
+
 class WindowsSendInputBackend:
     name = 'windows_send_input'
 
@@ -2287,6 +2426,8 @@ class Controller:
         self.action_input_tracking = False
         self.action_first_input_at = None
         self.last_action_detail = None
+        self.input_marker = os.getpid()
+        self.on_dispatch = None
         self.guard = None
         self.stop_gate = None
         self.releasing = False
@@ -2365,7 +2506,7 @@ class Controller:
         if self.ledger_path is None:
             return
         state = {'schema': INPUT_LEDGER_SCHEMA, 'build': SOURCE_BUILD, 'pid': os.getpid(), 'stop_vk': self.stop_vk,
-                 'keys': sorted(int(vk) for vk in self.down if not stop_equivalent(vk, self.stop_vk)),
+                 'keys': sorted(int(vk) for vk in self.down),
                  'mouse': sorted((list(value) if isinstance(value, tuple) else int(value)
                                   for value in self.mouse_down), key=str),
                  'touch': [{'locations': locations, 'rect': list(rect)} for locations, rect in self.touch_points]}
@@ -2387,6 +2528,39 @@ class Controller:
         self.ledger_last_state = serialized
         self.ledger_last_path = destination
 
+    def dispatch_event(self, inp):
+        if inp.type == 1:
+            code = int(inp.value.ki.wVk)
+            scan = int(inp.value.ki.wScan)
+            flags = int(inp.value.ki.dwFlags)
+            if scan and not code:
+                code = int(self.n.user.MapVirtualKeyW(scan | (0xE000 if flags & KEYEVENTF_EXTENDEDKEY else 0), 3))
+            return {'type': 'key', 'vk': int(physical_virtual_key(code, scan, 1 if flags & KEYEVENTF_EXTENDEDKEY else 0)),
+                    'down': not bool(flags & KEYEVENTF_KEYUP)}
+        if inp.type == 0:
+            data = inp.value.mi
+            flags = int(data.dwFlags)
+            value = int(data.mouseData)
+            if flags & MOUSEEVENTF_MOVE:
+                return {'type': 'mouse_move'}
+            if flags & (MOUSEEVENTF_LEFTDOWN | MOUSEEVENTF_LEFTUP):
+                return {'type': 'mouse_button', 'button': 'left', 'down': bool(flags & MOUSEEVENTF_LEFTDOWN)}
+            if flags & (MOUSEEVENTF_RIGHTDOWN | MOUSEEVENTF_RIGHTUP):
+                return {'type': 'mouse_button', 'button': 'right', 'down': bool(flags & MOUSEEVENTF_RIGHTDOWN)}
+            if flags & (MOUSEEVENTF_MIDDLEDOWN | MOUSEEVENTF_MIDDLEUP):
+                return {'type': 'mouse_button', 'button': 'middle', 'down': bool(flags & MOUSEEVENTF_MIDDLEDOWN)}
+            if flags & (MOUSEEVENTF_XDOWN | MOUSEEVENTF_XUP):
+                button_value = (value >> 16) & 0xFFFF or value & 0xFFFF
+                button = 'x1' if button_value == 1 else 'x2' if button_value == 2 else 'x' + str(button_value)
+                return {'type': 'mouse_button', 'button': button, 'down': bool(flags & MOUSEEVENTF_XDOWN)}
+            if flags & (MOUSEEVENTF_WHEEL | MOUSEEVENTF_HWHEEL):
+                delta = ctypes.c_short(value & 0xFFFF).value
+                if not delta:
+                    delta = ctypes.c_short((value >> 16) & 0xFFFF).value
+                return {'type': 'mouse_wheel', 'horizontal': bool(flags & MOUSEEVENTF_HWHEEL),
+                        'direction': 1 if delta > 0 else -1 if delta < 0 else 0}
+        return None
+
     def send(self, inp):
         release_input = (inp.type == 1 and bool(inp.value.ki.dwFlags & KEYEVENTF_KEYUP)) or (inp.type == 0 and bool(inp.value.mi.dwFlags & (MOUSEEVENTF_LEFTUP | MOUSEEVENTF_RIGHTUP | MOUSEEVENTF_MIDDLEUP | MOUSEEVENTF_XUP)))
         if inp.type == 1:
@@ -2396,7 +2570,7 @@ class Controller:
             if scan and not code:
                 code = int(self.n.user.MapVirtualKeyW(scan | (0xE000 if flags & KEYEVENTF_EXTENDEDKEY else 0), 3))
             physical_code = physical_virtual_key(code, scan, 1 if flags & KEYEVENTF_EXTENDEDKEY else 0)
-            if stop_equivalent(physical_code, self.stop_vk):
+            if stop_equivalent(physical_code, self.stop_vk) and not release_input:
                 return False
             if not release_input and (not safe_game_key(physical_code) or system_shortcut(set(self.down) | {physical_code})):
                 return False
@@ -2425,11 +2599,21 @@ class Controller:
             self.last_action_input_at = self.last_successful_input
         if self.action_input_tracking and not release_input and self.action_first_input_at is None:
             self.action_first_input_at = self.last_successful_input
+        if self.on_dispatch is not None:
+            event = self.dispatch_event(inp)
+            if event is not None:
+                event['at'] = self.last_successful_input
+                try:
+                    self.on_dispatch(event)
+                except Exception:
+                    pass
         return True
 
     def key(self, vk, pressed):
-        if stop_equivalent(vk, self.stop_vk):
+        if stop_equivalent(vk, self.stop_vk) and pressed:
             return False
+        if not pressed and vk not in self.down:
+            return True
         if pressed and vk in self.down:
             return True
         scan = self.n.user.MapVirtualKeyW(vk, 0)
@@ -2437,7 +2621,7 @@ class Controller:
         flags = (KEYEVENTF_SCANCODE if scan else 0) | (KEYEVENTF_EXTENDEDKEY if extended else 0) | (0 if pressed else KEYEVENTF_KEYUP)
         data = INPUT()
         data.type = 1
-        data.value.ki = KEYBDINPUT(0 if scan else vk, scan, flags, 0, 0)
+        data.value.ki = KEYBDINPUT(0 if scan else vk, scan, flags, 0, self.input_marker)
         previous_down = vk in self.down
         if pressed:
             self.down.add(vk)
@@ -2467,7 +2651,7 @@ class Controller:
             return True
         data = INPUT()
         data.type = 0
-        data.value.mi = MOUSEINPUT(x, y, wheel & 0xFFFFFFFF, flags, 0, 0)
+        data.value.mi = MOUSEINPUT(x, y, wheel & 0xFFFFFFFF, flags, 0, self.input_marker)
         previous_mouse = set(self.mouse_down)
         changes = False
         for bit in (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_MIDDLEDOWN):
@@ -3187,7 +3371,10 @@ def quarantine_corrupt_store(folder, failure):
 
 class ReplayStore:
     def __init__(self, folder):
-        self.db = sqlite3.connect(str(folder / 'experience.sqlite3'), timeout=12)
+        self.folder = pathlib.Path(folder)
+        self.database_path = self.folder / 'experience.sqlite3'
+        self.capacity_frames_skipped = 0
+        self.db = sqlite3.connect(str(self.database_path), timeout=12)
         try:
             existing_tables = {row[0] for row in self.db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
             if existing_tables and self.db.execute('PRAGMA user_version').fetchone()[0] != MODEL_FORMAT:
@@ -3328,6 +3515,13 @@ class ReplayStore:
             return False
         compressed = zlib.compress(obs.raw, 4)
         uid = str(getattr(obs, 'frame_uid', '')) or hashlib.sha256(compressed + str(game).encode() + str(step).encode() + str(action).encode()).hexdigest()
+        capacity = storage_resource_snapshot(self.folder).get('storage_capacity_factor', 1.0)
+        if capacity is not None:
+            capacity = max(0.0, min(1.0, float(capacity)))
+            capacity_roll = int(hashlib.sha256(uid.encode('utf-8', 'replace')).hexdigest()[:16], 16) / float(1 << 64)
+            if capacity_roll >= capacity:
+                self.capacity_frames_skipped += 1
+                return False
         result = self.db.execute('INSERT INTO keyframes(at,game,step,action,signature,valid,width,height,frame,uid) VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(uid) DO NOTHING', (time.time(), canonical_game_key(game), int(step), action, obs.signature, int(obs.valid), W, H, sqlite3.Binary(compressed), uid))
         self.frame_step[game] = step
         if result.rowcount:
@@ -3411,6 +3605,7 @@ class GameData:
         self.target_task_bias = None
         self.counts = [0] * count
         self.action_attempts = [0] * count
+        self.user_action_samples = [0] * count
         self.action_effect = [0.0] * count
         self.action_effect_samples = [0] * count
         self.action_goal = [0.0] * count
@@ -3604,6 +3799,7 @@ class GameData:
         other_steps = other.game_steps
         for i in range(len(self.counts)):
             self.action_attempts[i] += other.action_attempts[i]
+            self.user_action_samples[i] += other.user_action_samples[i]
             left, right = self.counts[i], other.counts[i]
             if right > 0:
                 if left > 0:
@@ -4118,6 +4314,7 @@ class GameData:
             'task_q_samples': self.task_q_samples,
             'counts': self.counts,
             'action_attempts': self.action_attempts,
+            'user_action_samples': self.user_action_samples,
             'action_effect': self.action_effect,
             'action_effect_samples': self.action_effect_samples,
             'action_goal': self.action_goal,
@@ -4401,6 +4598,20 @@ class Brain:
         self.training_last_tick = time.monotonic()
         self.storage_last_tick = time.monotonic()
         self.storage_cost_ema = 0.0
+        self.storage_metrics_lock = threading.Lock()
+        self.storage_metrics = storage_resource_snapshot(self.folder)
+        self.storage_metrics_last_sample = time.monotonic()
+        self.storage_growth_bytes_per_second = 0.0
+        self.capacity_frames_skipped = 0
+        estimated_before = [0.0] * FEATURE_COUNT
+        estimated_after = [0.0] * FEATURE_COUNT
+        estimated_detail = {}
+        estimated_transition = {'before': estimated_before, 'after': estimated_after,
+                                'action_detail': estimated_detail, 'game': '', 'action': '',
+                                'reward': 0.0, 'confidence': 0.0}
+        self.estimated_transition_bytes = (sys.getsizeof(estimated_transition)
+            + sum(sys.getsizeof(value) for value in estimated_transition.values())
+            + 2 * FEATURE_COUNT * sys.getsizeof(0.0))
         self.vision_cost_ema = 0.0
         self.training_cost_ema = 0.0
         self.capture_wait_ema = 0.0
@@ -4412,9 +4623,7 @@ class Brain:
         memory_capacity = 16000 if self.np is not None else 3500
         available_memory = available_physical_memory_bytes()
         if available_memory is not None:
-            estimated_transition_bytes = (2 * sys.getsizeof([0.0] * FEATURE_COUNT)
-                                          + 2 * FEATURE_COUNT * sys.getsizeof(0.0) + 4096)
-            memory_capacity = max(1, min(memory_capacity, available_memory // max(1, estimated_transition_bytes * 4)))
+            memory_capacity = max(1, min(memory_capacity, available_memory // max(1, self.estimated_transition_bytes * 4)))
         self.memory = deque(maxlen=memory_capacity)
         self.rare_memory = deque(maxlen=max(1, int(memory_capacity * (0.05 if self.np is not None else 0.0714))))
         self.control_memory = deque(maxlen=max(1, int(memory_capacity * 0.04)))
@@ -8129,6 +8338,28 @@ class Brain:
                 return cached[2]
             return None
 
+    def observed_user_action_support(self, game, index):
+        if index < 0 or index >= len(self.actions):
+            return 0.0
+        action = self.actions[index]
+        def samples(vk):
+            total = 0
+            for prefix in ('key:', 'hold:'):
+                source = self.action_index.get(prefix + str(int(vk)))
+                if source is not None:
+                    total += max(0, int(game.user_action_samples[source]))
+            return total
+        if action.kind in ('key', 'hold', 'move_fire', 'combat') and action.a:
+            count = samples(action.a)
+        elif action.kind in ('chord', 'pair_hold') and action.a and action.b:
+            count = min(samples(action.a), samples(action.b))
+        elif action.kind in ('click', 'right', 'double', 'middle', 'xbutton', 'swipe', 'right_swipe',
+                             'look', 'wheel', 'hwheel'):
+            count = max(0, int(game.user_action_samples[index]))
+        else:
+            count = 0
+        return count / (count + 1.0) if count else 0.0
+
     def choose(self, obs):
         with self.lock:
             game = self.game
@@ -8198,8 +8429,10 @@ class Brain:
                     ineffective = float(local[3]) if local is not None and local_attempts >= 2 else 0.0
                     repeat_penalty = max(0.12, 1.0 - 0.82 * ineffective * min(1.0, local_attempts / 5.0))
                     novelty_bonus = (1.0 + 0.75 / (1.0 + local_attempts)) if exploration_phase != 'policy' else 1.0
+                    observed_support = self.observed_user_action_support(game, i)
                     weights.append(max(0.001, action.prior * factor * context_factor * applicability * repeat_penalty
-                                       * novelty_bonus * (1.0 + 2.0 * effect) / math.sqrt(1.0 + game.counts[i] * 0.20)))
+                                       * novelty_bonus * (1.0 + 2.0 * effect) * (1.0 + observed_support)
+                                       / math.sqrt(1.0 + game.counts[i] * 0.20)))
                 return self.choose_joint(obs, [self.rng.choices(indices, weights=weights, k=1)[0]])
             values = self.scores(obs)
             for family, indices in self.action_families.items():
@@ -8207,7 +8440,7 @@ class Brain:
                               0.014 * movement_evidence if family in ('keyboard', 'navigation') else
                               0.008 * movement_evidence)
                 for index in indices:
-                    values[index] += contextual
+                    values[index] += contextual * (1.0 + self.observed_user_action_support(game, index))
             if game.world or game.world_network_steps >= 28:
                 candidates = sorted(range(len(values)), key=values.__getitem__, reverse=True)[:6]
                 for index in candidates:
@@ -11585,6 +11818,31 @@ class Brain:
                 self.storage_force = True
             self.storage_condition.notify_all()
 
+    def storage_metrics_snapshot(self):
+        with self.storage_metrics_lock:
+            return dict(self.storage_metrics)
+
+    def refresh_storage_metrics(self):
+        now = time.monotonic()
+        current = storage_resource_snapshot(self.folder)
+        with self.storage_metrics_lock:
+            previous = self.storage_metrics
+            elapsed = max(0.0, now - self.storage_metrics_last_sample)
+            prior_bytes = int(previous.get('persistent_data_bytes') or 0)
+            current_bytes = int(current.get('persistent_data_bytes') or 0)
+            if elapsed > 0.0:
+                observed_growth = max(0.0, (current_bytes - prior_bytes) / elapsed)
+                self.storage_growth_bytes_per_second = (observed_growth if self.storage_growth_bytes_per_second <= 0.0
+                    else 0.82 * self.storage_growth_bytes_per_second + 0.18 * observed_growth)
+            free = current.get('disk_free_bytes')
+            growth = self.storage_growth_bytes_per_second
+            current['storage_growth_bytes_per_second'] = growth
+            current['estimated_time_to_full_seconds'] = (float(free) / growth
+                if free is not None and growth > 0.0 else None)
+            self.storage_metrics = current
+            self.storage_metrics_last_sample = now
+            return dict(current)
+
     def storage_loop(self):
         if self.background_training:
             set_current_thread_priority(-1)
@@ -11593,6 +11851,7 @@ class Brain:
             while True:
                 iteration_started = time.perf_counter()
                 self.storage_last_tick = time.monotonic()
+                self.refresh_storage_metrics()
                 self._retry_journal()
                 with self.storage_condition:
                     stopping = self.storage_stop.is_set()
@@ -11619,10 +11878,14 @@ class Brain:
                     if connected:
                         self._drain_spool()
                         for key, (step, observation) in initial:
+                            skipped_before = self.store.capacity_frames_skipped
                             self.store.frame(key, step, 'initial', observation, force=True)
+                            self.capacity_frames_skipped += self.store.capacity_frames_skipped - skipped_before
                         for frame in frames:
                             game_key, step, index, observation = frame[:4]
+                            skipped_before = self.store.capacity_frames_skipped
                             self.store.frame(game_key, step + (0 if len(frame) > 5 and frame[5] == 'before' else 1), self.actions[index].id, observation, force=bool(frame[4]) if len(frame) > 4 else False)
+                            self.capacity_frames_skipped += self.store.capacity_frames_skipped - skipped_before
                         inserted = self.store.add_many(batch) if batch else 0
                         unresolved = False
                         resolved_terminal = []
@@ -12450,7 +12713,18 @@ class Brain:
             try:
                 if self.background_training and self.training_cost_ema > 0.0:
                     load = system_cpu_load()
-                    if load is not None and self.training_stop.wait(load * self.training_cost_ema):
+                    metrics = self.storage_metrics_snapshot()
+                    capacity_factor = max(0.0, min(1.0, float(metrics.get('storage_capacity_factor', 1.0))))
+                    disk_scarcity = (1.0 - capacity_factor) / max(capacity_factor, 1e-9)
+                    available_memory = available_physical_memory_bytes()
+                    estimated_memory = self.estimated_transition_bytes * (len(self.memory) + len(self.training_queue))
+                    memory_pressure = (estimated_memory / (estimated_memory + available_memory)
+                                       if available_memory is not None and estimated_memory + available_memory > 0 else 0.0)
+                    memory_scarcity = memory_pressure / max(1.0 - memory_pressure, 1e-9)
+                    cpu_scarcity = (float(load) / max(1.0 - float(load), 1e-9)
+                                    if load is not None and math.isfinite(float(load)) else 0.0)
+                    wait_factor = min(1.0, max(disk_scarcity, memory_scarcity, cpu_scarcity))
+                    if self.training_stop.wait(wait_factor * self.training_cost_ema):
                         break
                 with self.training_condition:
                     if not self.training_queue:
@@ -12472,10 +12746,19 @@ class Brain:
                     else:
                         capacity = 24 if backlog > 24 else 8
                         replay_count = 12
+                    metrics = self.storage_metrics_snapshot()
+                    capacity_factor = max(0.0, min(1.0, float(metrics.get('storage_capacity_factor', 1.0))))
+                    disk_scarcity = (1.0 - capacity_factor) / max(capacity_factor, 1e-9)
+                    available_memory = available_physical_memory_bytes()
+                    estimated_memory = self.estimated_transition_bytes * (len(self.memory) + len(self.training_queue))
+                    memory_pressure = (estimated_memory / (estimated_memory + available_memory)
+                                       if available_memory is not None and estimated_memory + available_memory > 0 else 0.0)
+                    memory_scarcity = memory_pressure / max(1.0 - memory_pressure, 1e-9)
                     pressure = max(self.vision_cost_ema / 0.38, self.training_cost_ema / 0.65,
-                                   self.capture_wait_ema / 0.34, self.decision_cost_ema / 0.36)
+                                   self.capture_wait_ema / 0.34, self.decision_cost_ema / 0.36,
+                                   disk_scarcity, memory_scarcity)
                     if pressure > 1.0:
-                        scale = max(0.35, min(1.0, 1.0 / pressure))
+                        scale = min(1.0, 1.0 / pressure)
                         capacity = max(1, int(capacity * scale))
                         replay_count = max(1, int(replay_count * scale))
                     active_game = self.games.get(self.game_key)
@@ -12808,6 +13091,8 @@ class Brain:
                     game.counts[new_idx] = integer(counts[old_idx])
                     attempts = stored.get('action_attempts', [])
                     game.action_attempts[new_idx] = integer(attempts[old_idx]) if isinstance(attempts, list) and old_idx < len(attempts) else game.counts[new_idx]
+                    user_samples = stored.get('user_action_samples', [])
+                    game.user_action_samples[new_idx] = integer(user_samples[old_idx]) if isinstance(user_samples, list) and old_idx < len(user_samples) else 0
                     for field, result, minimum, maximum in (('action_effect', game.action_effect, -0.3, 1.0), ('action_effect_samples', game.action_effect_samples, 0.0, 1000000000.0),
                                                             ('action_goal', game.action_goal, -1.0, 1.0), ('action_goal_samples', game.action_goal_samples, 0.0, 1000000000.0)):
                         values = stored.get(field, [])
@@ -13335,6 +13620,8 @@ class GameAgent:
         self.physical_input_overflow = False
         self.physical_input_tracking_available = False
         self.physical_interference_actions = 0
+        self.input_dispatch_tracker = InputDispatchTracker()
+        self.injected_input_tracking_available = False
         self.learning_activity = 'initializing'
         self.physical_history = deque(maxlen=32)
         self.physical_pending_events = []
@@ -13520,6 +13807,10 @@ class GameAgent:
                 'action_conditioned_visual_error': self.brain.vision_model.transition_error if self.brain is not None else None,
                 'training_problem': self.brain.training_problem if self.brain is not None else None,
                 'storage_problem': self.brain.storage_problem if self.brain is not None else None,
+                'storage_resource_metrics': self.brain.storage_metrics_snapshot() if self.brain is not None else {},
+                'storage_capacity_frames_skipped': self.brain.capacity_frames_skipped if self.brain is not None else 0,
+                'user_observed_action_samples': sum(self.brain.game.user_action_samples) if self.brain is not None else 0,
+                'user_observed_action_types': sum(1 for value in self.brain.game.user_action_samples if value > 0) if self.brain is not None else 0,
                 'storage_failures': self.brain.storage_failures if self.brain is not None else 0,
                 'storage_queue_keyframes': len(self.brain.frame_backlog) if self.brain is not None else 0,
                 'storage_keyframes_skipped': self.brain.keyframes_skipped if self.brain is not None else 0,
@@ -13594,8 +13885,13 @@ class GameAgent:
             'input_events_accepted_by_windows': self.controller.successful_inputs if self.controller is not None else 0,
             'action_input_attempts': self.controller.attempted_action_inputs if self.controller is not None else 0,
             'action_input_dispatches': self.controller.successful_action_inputs if self.controller is not None else 0,
-            'last_action_dispatch_at': self.controller.last_action_input_at if self.controller is not None else None,
+            'input_dispatch_tracking_available': self.injected_input_tracking_available,
+            'input_dispatch_observation': self.input_dispatch_tracker.snapshot(),
             'game_received_input': None,
+            'game_input_receipt_status': 'not_directly_observable',
+            'visual_effect_is_screen_proxy': True,
+            'goal_progress_is_screen_proxy': True,
+            'game_completion_verified': None,
             'stop_detection': getattr(self.listener, 'mode', 'parent_supervised' if self.externally_supervised else 'fallback_poll'),
             'first_run_checks': {
                 'capture_ok': self.last_capture_valid is True and bool(self.last_signature),
@@ -13644,10 +13940,13 @@ class GameAgent:
         self.listener = StopListener(self.native, self.stop_vk, self.stop_event, self.stop_gate,
                                      input_callback=input_callback, target_pid=self.capture_target_pid,
                                      target_hwnd=self.capture_target_hwnd,
-                                     consume_stop_key=self.operation != 'cultivate')
+                                     consume_stop_key=self.operation != 'cultivate',
+                                     injected_callback=self.enqueue_injected_input if self.operation == 'agent' else None)
         self.listener.start()
         self.physical_input_tracking_available = bool(self.operation == 'agent' and self.input_queue is not None
                                                        and self.listener.input_monitor_healthy())
+        self.injected_input_tracking_available = bool(self.operation == 'agent'
+            and self.listener.input_monitor_healthy())
         if not self.listener.healthy() and not self.stop_event.is_set():
             raise OSError('停止键双通道监听无法正常运行')
 
@@ -13689,6 +13988,7 @@ class GameAgent:
         result = self.brain.learn_inverse_dynamics(self.brain.game, before, after, index, confidence)
         if result is None:
             return False
+        self.brain.game.user_action_samples[index] += 1
         self.physical_input_samples += 1
         self.last_experience_at = time.time()
         return True
@@ -14057,6 +14357,13 @@ class GameAgent:
             frame = self.sensor_frame
         return bool(self.sensor_thread is None or not self.sensor_thread.is_alive()
                     or frame is None or time.monotonic() - frame[2] > max_age)
+
+    def enqueue_injected_input(self, event):
+        if self.operation == 'agent':
+            self.input_dispatch_tracker.observed(event)
+
+    def enqueue_expected_input(self, event):
+        self.input_dispatch_tracker.expected(event)
 
     def enqueue_physical_input(self, event):
         if self.operation == 'agent' and isinstance(event, dict):
@@ -14515,6 +14822,7 @@ class GameAgent:
                         self.controller = Controller(self.native, self.stop_vk, self.stop_event)
                         self.controller.ledger_path = self.folder / 'active_inputs.json'
                         self.controller.stop_gate = self.stop_gate
+                        self.controller.on_dispatch = self.enqueue_expected_input if self.operation == 'agent' else None
                     if self.brain is None:
                         self.brain = Brain(self.folder, self.stop_vk, self.np)
                         if self.brain.store_problem:
@@ -14647,6 +14955,7 @@ class GameAgent:
                                 continue
                         self.action_user_interference = False
                         self.action_physical_input_generation = pre_action_input_generation
+                        dispatch_before = self.input_dispatch_tracker.snapshot()
                         self.monitor_candidate_sequence = -1
                         self.monitor_candidate_streak = 0
                         self.monitor_action_target = ((float(model_parameters['start_x']), float(model_parameters['start_y']))
@@ -14715,6 +15024,17 @@ class GameAgent:
                             with self.physical_input_lock:
                                 self.action_user_interference = (self.action_user_interference
                                     or self.physical_input_generation != self.action_physical_input_generation)
+                        dispatch_after = self.input_dispatch_tracker.snapshot()
+                        action_detail['input_dispatch_hook_available'] = self.injected_input_tracking_available
+                        action_detail['input_dispatch_expected_by_controller'] = dispatch_after['expected'] - dispatch_before['expected']
+                        action_detail['input_dispatch_observed_by_low_level_hook'] = dispatch_after['observed'] - dispatch_before['observed']
+                        action_detail['input_dispatch_matched_by_low_level_hook'] = dispatch_after['matched'] - dispatch_before['matched']
+                        action_detail['input_dispatch_pending_expected'] = dispatch_after['pending_expected']
+                        action_detail['input_dispatch_pending_observed'] = dispatch_after['pending_observed']
+                        action_detail['user_observed_action_support'] = self.brain.observed_user_action_support(
+                            self.brain.game, action_index) if self.brain is not None else 0.0
+                        action_detail['game_input_received_verified'] = None
+                        action_detail['game_input_receipt_proven'] = False
                         action_detail['feedback_valid'] = action_feedback_is_valid(
                             rect, newrect, feedback, self.physical_input_tracking_available,
                             self.action_user_interference)
@@ -16831,9 +17151,9 @@ def verify_v20_regressions(agent, observation):
     controller = Controller(simulated, agent.stop_vk, threading.Event())
     interaction = agent.action_index['compose:interact']
     params = agent.preview_action_parameters(agent.game, interaction, observation)
-    params = params[:8] + (True,)
+    params = tuple(params[:6]) + (16, 69, True)
     assert controller.execute(agent.actions[interaction], observation, (0, 0, 1280, 720),
-                              0, params, feedback_delay=0.15)
+                              0, params, feedback_delay=0.15), repr((agent.stop_vk, params, controller.down, controller.mouse_down, safe_game_key(params[6]), safe_game_key(params[7]), system_shortcut(params[6:8])))
     assert controller.last_action_detail['a'] == params[6]
     assert controller.last_action_detail['spatial'] and keyboard.mouse >= 2
     assert keyboard.keys and not any(stop_equivalent(code, agent.stop_vk) for code in keyboard.keys)
@@ -17240,6 +17560,16 @@ lsb_gate = engine.StopKeyGate(fake, stop_vk, engine.threading.Event())
 assert not lsb_gate.poll() and not lsb_gate.stop_event.is_set()
 fake.user.GetAsyncKeyState = saved_state_reader
 assert control.key(stop_vk, True) is False and fake.user.accepted == 0
+assert all(not engine.safe_game_key(key) for key in (0x13, 0x14, 0x2C, 0x2D, 0x90, 0x91, 0xA6, 0xA7))
+assert all(engine.safe_game_key(key) for key in (16, 17, 18, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5))
+assert engine.system_shortcut({17, 16, 87})
+tracker = engine.InputDispatchTracker()
+tracker.expected({'type': 'key', 'vk': 65, 'down': True})
+tracker.observed({'type': 'key', 'vk': 65, 'down': True})
+tracker.observed({'type': 'mouse_button', 'button': 'left', 'down': True})
+tracker_state = tracker.snapshot()
+assert tracker_state['expected'] == 1 and tracker_state['observed'] == 2
+assert tracker_state['matched'] == 1 and tracker_state['pending_observed'] == 1
 assert engine.temporal_response_confidence([0.06, 0.07, 0.068], [0.01, 0.005], 0.002, 0.95) > engine.temporal_response_confidence([0.06, 0.08, 0.008], [0.07, 0.07], 0.01, 0.10)
 class WorkerIdentity:
     pid = 12345
@@ -17249,11 +17579,18 @@ assert engine.worker_progress_snapshot(workspace, 'test-session', WorkerIdentity
 assert engine.worker_progress_snapshot(workspace, 'another-session', WorkerIdentity()) is None
 progress_path.unlink()
 candidate = next(v for v in (65, 66, 67, 68, 70, 71, 72) if not engine.stop_equivalent(v, stop_vk))
+dispatch_probe = engine.InputDispatchTracker()
+control.on_dispatch = dispatch_probe.expected
 assert control.key(candidate, True) and control.down == {candidate}
 assert engine.json.loads(control.ledger_path.read_text(encoding='utf-8'))['keys'] == [candidate]
 control.release()
 assert not engine.json.loads(control.ledger_path.read_text(encoding='utf-8'))['keys']
 assert not control.down and fake.user.accepted == 2
+assert dispatch_probe.snapshot()['expected'] == 2
+assert dispatch_probe.observed({'type': 'key', 'vk': candidate, 'down': True})
+assert dispatch_probe.observed({'type': 'key', 'vk': candidate, 'down': False})
+assert dispatch_probe.snapshot()['matched'] == 2
+control.on_dispatch = None
 composed_keys = [key for key in (65, 66, 67, 68, 69, 70) if not engine.stop_equivalent(key, stop_vk)][:3]
 composed_action = engine.Action('compose:regression', 'compose', duration=0.025)
 compose_observation = type('ComposeObservation', (), {'change': 0.0})()
@@ -17358,15 +17695,45 @@ while writer.is_alive():
 writer.join()
 assert stage_probe.stage_cost_snapshot()['concurrent'][1] == 300
 cultivation_probe = engine.App.__new__(engine.App)
+recovery_fake = FakeNative()
+cultivation_probe.n = recovery_fake
 cultivation_probe.process_operation = 'cultivate'
+cultivation_probe.process_stop_vk = 65
+cultivation_probe.chosen_stop_key = lambda: 65
 cultivation_probe.folder = workspace
 cultivation_probe.worker_input_recoveries = 0
 cultivation_probe.pending_release_controller = None
+cultivation_probe.write_supervisor_state = lambda phase: None
+cultivation_probe.record_supervisor_failure = lambda exc: None
 legacy_ledger = workspace / 'active_inputs.json'
 legacy_ledger.write_text(engine.json.dumps({'schema': engine.INPUT_LEDGER_SCHEMA, 'build': 'old',
-    'pid': 1, 'stop_vk': 27, 'keys': [65], 'mouse': [], 'touch': [], 'updated': engine.time.time()}), encoding='utf-8')
+    'pid': 1, 'stop_vk': 27, 'keys': [65], 'mouse': [engine.MOUSEEVENTF_LEFTDOWN],
+    'touch': [], 'updated': engine.time.time()}), encoding='utf-8')
 assert cultivation_probe.restore_orphaned_inputs()
-assert engine.json.loads(legacy_ledger.read_text(encoding='utf-8'))['keys'] == [65]
+recovered_ledger = engine.json.loads(legacy_ledger.read_text(encoding='utf-8'))
+assert recovered_ledger['keys'] == [] and recovered_ledger['mouse'] == []
+assert cultivation_probe.worker_input_recoveries == 1 and recovery_fake.user.accepted == 2
+physical_probe = engine.App.__new__(engine.App)
+physical_fake = FakeNative()
+physical_probe.n = physical_fake
+physical_probe.process_operation = 'cultivate'
+physical_probe.process_stop_vk = 27
+physical_probe.chosen_stop_key = lambda: 27
+physical_probe.folder = workspace
+physical_probe.worker_input_recoveries = 0
+physical_probe.pending_release_controller = None
+physical_probe.write_supervisor_state = lambda phase: None
+physical_probe.record_supervisor_failure = lambda exc: None
+physical_probe.recovery_listener = type('PhysicalState', (), {
+    'input_monitor_healthy': lambda self: True,
+    'physical_state_snapshot': lambda self: ({160}, {'left'})})()
+legacy_ledger.write_text(engine.json.dumps({'schema': engine.INPUT_LEDGER_SCHEMA, 'build': 'old',
+    'pid': 1, 'stop_vk': 27, 'keys': [16, 65], 'mouse': [engine.MOUSEEVENTF_LEFTDOWN],
+    'touch': [], 'updated': engine.time.time()}), encoding='utf-8')
+assert physical_probe.restore_orphaned_inputs()
+physical_recovered = engine.json.loads(legacy_ledger.read_text(encoding='utf-8'))
+assert physical_recovered['keys'] == [] and physical_recovered['mouse'] == []
+assert physical_fake.user.accepted == 1
 retry_probe = engine.App.__new__(engine.App)
 retry_probe.running = False
 retry_probe.folder = workspace
@@ -17379,7 +17746,7 @@ retry_probe.launch('agent')
 assert retry_calls == [True]
 legacy_keys, legacy_mouse, legacy_touch = engine.normalize_input_ledger(
     {'build': 'older-build', 'keys': [65, 27, 0], 'mouse': [engine.MOUSEEVENTF_LEFTDOWN], 'touch': []}, 27)
-assert legacy_keys == {65} and legacy_mouse == {engine.MOUSEEVENTF_LEFTDOWN} and not legacy_touch
+assert legacy_keys == {65, 27} and legacy_mouse == {engine.MOUSEEVENTF_LEFTDOWN} and not legacy_touch
 assert engine.temporal_discount(0.1, 0.1) == engine.DISCOUNT
 assert engine.temporal_discount(0.1, 0.2) > engine.temporal_discount(0.1, 0.1)
 reference_game = type('ReferenceGame', (), {'feedback_delay': 0.12, 'feedback_latency_by_kind': {'move': [0.08, 2]}})()
@@ -17399,10 +17766,24 @@ assert engine.VisualRepresentation().restore(engine.json.loads(engine.json.dumps
 store = engine.ReplayStore(workspace)
 try:
     assert store.verify_roundtrip()
+    capacity_observation = type('CapacityObservation', (), {'raw': base_frame, 'novelty': 1.0,
+        'signature': 'capacity-test', 'valid': True, 'frame_uid': 'capacity-test'})()
+    original_storage_snapshot = engine.storage_resource_snapshot
+    try:
+        engine.storage_resource_snapshot = lambda folder: {'storage_capacity_factor': 0.0}
+        assert not store.frame('capacity-test', 1, 'initial', capacity_observation, force=True)
+        assert store.capacity_frames_skipped == 1
+    finally:
+        engine.storage_resource_snapshot = original_storage_snapshot
 finally:
     store.close()
+resource_snapshot = engine.storage_resource_snapshot(workspace)
+assert 0.0 <= resource_snapshot['storage_capacity_factor'] <= 1.0
 agent = engine.Brain(workspace, stop_vk, numeric)
 try:
+    resource_metrics = agent.refresh_storage_metrics()
+    assert 'disk_free_bytes' in resource_metrics and 'storage_growth_bytes_per_second' in resource_metrics
+    assert 'estimated_time_to_full_seconds' in resource_metrics
     raw = bytearray(bytes((40, 95, 170, 255)) * (engine.W * engine.H))
     for index in range(0, engine.W * engine.H, 13):
         pos = index * 4
@@ -17584,6 +17965,10 @@ try:
     agent.game.goal_proposals['relation:contact'] = [3.0, 4.0, 2.5, 'c:123', 31]
     agent.game.scene_action_memory[before.signature + ':' + str(index)] = [11, 0.24, 0.82, 0.65, 0.08]
     agent.game.scene_graph[before.signature + ':' + after.signature] = [7, 0.24, 0.81, 0.67, 0.0]
+    observed_key_index = agent.action_index['key:66']
+    observed_hold_index = agent.action_index['hold:66']
+    agent.game.user_action_samples[observed_key_index] = 5
+    assert agent.observed_user_action_support(agent.game, observed_hold_index) == 5.0 / 6.0
     agent.save(force=True)
 finally:
     agent.close()
@@ -17605,6 +17990,8 @@ try:
     assert restored.game.intent_values['i:primary_select'] == [7.0, 2.0, 1.8, 4.0]
     assert restored.game.goal_proposals['relation:contact'] == [3.0, 4.0, 2.5, 'c:123', 31]
     assert restored.game.goal_hypotheses['number:2:1'] == [4.0, 0.0, 0.0, 2.0]
+    assert restored.game.user_action_samples[observed_key_index] == 5
+    assert restored.observed_user_action_support(restored.game, observed_hold_index) == 5.0 / 6.0
     assert restored.game.hierarchical_controls
     assert restored.game.repeat_effects['c:synthetic:' + up_id] == [5.0, 1.0, 3.0, 6]
     assert restored.game.inverse_dynamics['move_up'][0] == 12
@@ -17650,6 +18037,14 @@ class DesktopNative:
     ensure_ascii=False), encoding='utf-8')
 (workspace / 'runtime_state.json').write_text(engine.json.dumps({'running': True, 'operation': 'agent',
     'physical_input_tracking_available': False, 'physical_interference_actions': 2,
+    'input_dispatch_tracking_available': True,
+    'input_dispatch_observation': {'expected': 3, 'observed': 2, 'matched': 2,
+                                   'pending_expected': 1, 'pending_observed': 0},
+    'game_input_receipt_status': 'not_directly_observable', 'game_completion_verified': None,
+    'visual_effect_is_screen_proxy': True, 'goal_progress_is_screen_proxy': True,
+    'storage_resource_metrics': {'disk_free_bytes': 123456, 'storage_capacity_factor': 0.75},
+    'storage_capacity_frames_skipped': 4, 'user_observed_action_samples': 8,
+    'user_observed_action_types': 3,
     'pending_storage_records': 1, 'pending_storage_batches': 1}, ensure_ascii=False), encoding='utf-8')
 archive_path = engine.blackbox(DesktopNative(), workspace, None, mode, stop_vk, operation='agent')
 assert archive_path.stat().st_size <= 1000000
@@ -17660,7 +18055,16 @@ with engine.zipfile.ZipFile(archive_path) as archive:
     assert metadata['running'] and metadata['running_operation'] == 'agent'
     assert metadata['snapshot_source'] == 'persisted_runtime_and_read_only_database'
     assert metadata['snapshot_consistency'] == 'atomic_per_file_and_single_read_only_sqlite_transaction'
+    assert metadata['actual_game_validation_status'] == 'requires_live_game_test'
+    assert metadata['game_input_receipt_status'] == 'not_directly_observable'
+    assert metadata['input_dispatch_tracking_available'] is True
+    assert metadata['input_dispatch_observation']['matched'] == 2
+    assert metadata['storage_resource_metrics']['storage_capacity_factor'] == 0.75
+    assert metadata['storage_capacity_frames_skipped'] == 4
+    assert metadata['user_observed_action_samples'] == 8
+    assert metadata['user_observed_action_types'] == 3
     assert metadata['learning_feedback_safe_mode']
+    assert archive.testzip() is None
     assert metadata['archive_contents']['worker_stderr_included']
     assert metadata['archive_contents']['worker_heartbeat_included']
     assert 'worker_stderr_tail.log' in archive.namelist()
@@ -17844,8 +18248,12 @@ def read_blackbox_history(folder, limit=250):
                          'interruption_reason', 'feedback_valid', 'response_onset_seconds', 'learning_causality',
                          'learning_action_effect', 'learning_objective_signal', 'learning_information_signal',
                          'learning_objective_tier', 'learning_goal_confidence', 'learning_screen_result',
-                         'outcome_credit', 'credit_confidence', 'game_input_received_verified', 'early_visual_feedback',
-                         'pre_action_visual_change')
+                         'outcome_credit', 'credit_confidence', 'game_input_received_verified',
+                         'game_input_receipt_proven', 'input_dispatch_hook_available',
+                         'input_dispatch_expected_by_controller', 'input_dispatch_observed_by_low_level_hook',
+                         'input_dispatch_matched_by_low_level_hook', 'input_dispatch_pending_expected',
+                         'input_dispatch_pending_observed', 'user_observed_action_support',
+                         'early_visual_feedback', 'pre_action_visual_change')
         for at, game, action, reward, change, done, confidence, details in reversed(rows):
             try:
                 parsed = json.loads(details) if isinstance(details, str) else {}
@@ -17956,6 +18364,7 @@ def blackbox(native, folder, agent, mode, stop_vk, window_identity=None, operati
         'offline_static_and_synthetic_not_game_verified': True,
         'actual_game_success_rate': None,
         'actual_game_input_receipt_verified': None,
+        'actual_game_validation_status': 'requires_live_game_test',
         'visual_input_causality_is_proxy': True,
         'world_prediction_error_variance': brain.game.prediction_error_variance if brain else None,
         'world_scene_holdout_samples': sum(max(0, int(record[0])) for record in brain.game.world_holdout_groups.values()) if brain else 0,
@@ -18023,6 +18432,17 @@ def blackbox(native, folder, agent, mode, stop_vk, window_identity=None, operati
         'credible_goal_progress_events': agent.credible_goal_progress_events if agent else 0,
         'touch_injection_supported': agent.controller.touch_available if agent and agent.controller else None,
         'game_input_receipt_measurement_available': False,
+        'game_input_receipt_status': 'not_directly_observable',
+        'game_input_receipt_verified': None,
+        'game_completion_verified': None,
+        'visual_effect_is_screen_proxy': True,
+        'goal_progress_is_screen_proxy': True,
+        'input_dispatch_tracking_available': agent.injected_input_tracking_available if agent else False,
+        'input_dispatch_observation': agent.input_dispatch_tracker.snapshot() if agent else {},
+        'storage_resource_metrics': brain.storage_metrics_snapshot() if brain else {},
+        'storage_capacity_frames_skipped': brain.capacity_frames_skipped if brain else 0,
+        'user_observed_action_samples': sum(brain.game.user_action_samples) if brain else 0,
+        'user_observed_action_types': sum(1 for value in brain.game.user_action_samples if value > 0) if brain else 0,
         'storage_problem': brain.storage_problem if brain else None,
         'storage_failures': brain.storage_failures if brain else 0,
         'pending_keyframes': len(brain.frame_backlog) if brain else 0,
@@ -18087,8 +18507,12 @@ def blackbox(native, folder, agent, mode, stop_vk, window_identity=None, operati
                          'visual_no_effect_confirmations', 'visually_undetermined_inputs',
                          'credible_goal_progress_events', 'input_failures', 'sensor_restarts',
                          'physical_input_tracking_available', 'physical_input_tracking_overflow',
-                         'physical_interference_actions', 'pending_storage_records', 'pending_storage_batches',
-                         'operation', 'running')
+                         'physical_interference_actions', 'input_dispatch_tracking_available',
+                         'input_dispatch_observation', 'game_input_receipt_status', 'game_completion_verified',
+                         'visual_effect_is_screen_proxy', 'goal_progress_is_screen_proxy',
+                         'storage_resource_metrics', 'storage_capacity_frames_skipped',
+                         'user_observed_action_samples', 'user_observed_action_types',
+                         'pending_storage_records', 'pending_storage_batches', 'operation', 'running')
                         if key == 'runtime_snapshot' else
                         ('phase', 'worker_restarts', 'worker_last_returncode', 'worker_last_error',
                          'recovered_input_snapshots', 'stop_requested'))}
@@ -18105,6 +18529,13 @@ def blackbox(native, folder, agent, mode, stop_vk, window_identity=None, operati
                         manifest['valid_transitions'] = int(details.get('valid_transitions', 0))
                         manifest['game_identity'] = details.get('game')
                         manifest['total_proxy_reward'] = details.get('total_proxy_reward', 0.0)
+                        for metric in ('input_dispatch_tracking_available', 'input_dispatch_observation',
+                                       'game_input_receipt_status', 'game_completion_verified',
+                                       'visual_effect_is_screen_proxy', 'goal_progress_is_screen_proxy',
+                                       'storage_resource_metrics', 'storage_capacity_frames_skipped',
+                                       'user_observed_action_samples', 'user_observed_action_types'):
+                            if metric in details:
+                                manifest[metric] = details[metric]
                         for metric in ('actions_cut_short_by_visual_feedback', 'actions_cut_short_by_local_visual_feedback',
                                        'visual_effect_confirmations', 'visual_no_effect_confirmations',
                                        'visually_undetermined_inputs', 'credible_goal_progress_events',
@@ -18122,9 +18553,14 @@ def blackbox(native, folder, agent, mode, stop_vk, window_identity=None, operati
                             'training_failures', 'last_reward', 'learning_evidence_diagnostics',
                             'self_supervised_visual_steps', 'self_supervised_visual_error',
                             'screen_outcome_totals', 'last_decision', 'storage_problem',
+                            'storage_resource_metrics', 'storage_capacity_frames_skipped',
+                            'user_observed_action_samples', 'user_observed_action_types',
                             'checkpoint_verified', 'last_capture_valid', 'last_observation_quality',
                             'measured_pipeline_stages_milliseconds', 'action_input_attempts',
-                            'action_input_dispatches', 'game_received_input',
+                            'action_input_dispatches', 'input_dispatch_tracking_available',
+                            'input_dispatch_observation', 'game_received_input', 'game_input_receipt_status',
+                            'game_completion_verified', 'visual_effect_is_screen_proxy',
+                            'goal_progress_is_screen_proxy',
                             'actions_cut_short_by_local_visual_feedback', 'visual_effect_confirmations',
                             'visual_no_effect_confirmations', 'visually_undetermined_inputs',
                             'credible_goal_progress_events')
@@ -18163,6 +18599,13 @@ def blackbox(native, folder, agent, mode, stop_vk, window_identity=None, operati
                                     'checkpoint_last_summary': brain.last_checkpoint_summary}
         except Exception as exc:
             manifest['model_excerpt_error'] = f'{type(exc).__name__}: {str(exc)[:140]}'
+    def archive_valid(path):
+        try:
+            with zipfile.ZipFile(path, 'r') as archive:
+                return archive.testzip() is None
+        except Exception:
+            return False
+
     def write(include_state, event_count, include_screen, include_log, include_excerpt):
         manifest['archive_contents'] = {
             'checkpoint_included': bool(include_state and checkpoint_eligible),
@@ -18305,7 +18748,7 @@ def blackbox(native, folder, agent, mode, stop_vk, window_identity=None, operati
                 (False, 35, False, True, True), (False, 35, False, False, False),
                 (False, 0, False, False, False)):
             write(keep_state, event_count, screen, keep_log, keep_excerpt)
-            if temp.stat().st_size <= 1_000_000:
+            if temp.stat().st_size <= 1_000_000 and archive_valid(temp):
                 os.replace(temp, final)
                 return final
         minimal = {
@@ -18321,13 +18764,13 @@ def blackbox(native, folder, agent, mode, stop_vk, window_identity=None, operati
             archive.writestr('recent_actions.json', json.dumps(scrub_value(events[-12:]), ensure_ascii=False, separators=(',', ':')))
             if last_screen is not None:
                 archive.writestr('last_screen.png', encode_png(last_screen))
-        if temp.stat().st_size <= 1_000_000:
+        if temp.stat().st_size <= 1_000_000 and archive_valid(temp):
             os.replace(temp, final)
             return final
         with zipfile.ZipFile(temp, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
             archive.writestr('report.json', json.dumps(scrub_value(minimal), ensure_ascii=False, separators=(',', ':')))
             archive.writestr('recent_errors.json', json.dumps(errors[-1:], ensure_ascii=False, separators=(',', ':')))
-        if temp.stat().st_size <= 1_000_000:
+        if temp.stat().st_size <= 1_000_000 and archive_valid(temp):
             os.replace(temp, final)
             return final
         raise OSError('精简后的黑匣子仍超过 1 MB')
@@ -18577,6 +19020,12 @@ def run_agent_subprocess(configuration):
                          'storage_cost_ema_seconds': agent.brain.storage_cost_ema if agent.brain is not None else 0.0,
                          'physical_input_tracking_available': agent.physical_input_tracking_available,
                          'physical_interference_actions': agent.physical_interference_actions,
+                         'input_dispatch_tracking_available': agent.injected_input_tracking_available,
+                         'input_dispatch_observation': agent.input_dispatch_tracker.snapshot(),
+                         'storage_resource_metrics': agent.brain.storage_metrics_snapshot() if agent.brain is not None else {},
+                         'storage_capacity_frames_skipped': agent.brain.capacity_frames_skipped if agent.brain is not None else 0,
+                         'user_observed_action_samples': sum(agent.brain.game.user_action_samples) if agent.brain is not None else 0,
+                         'user_observed_action_types': sum(1 for value in agent.brain.game.user_action_samples if value > 0) if agent.brain is not None else 0,
                          'learning_activity': agent.learning_activity,
                          'training_heartbeat_age': max(0.0, now - agent.brain.training_last_tick)
                          if agent.brain is not None else None,
@@ -18924,15 +19373,33 @@ class App:
                 probe_listener.close()
             verification_key = (SOURCE_BUILD, str(self.folder.resolve()),
                                 getattr(self.numpy, '__name__', 'pure_python') if self.numpy is not None else 'pure_python', stop_vk)
-            if verification_key not in self.regression_verifications:
+            backend_name = getattr(self.numpy, '__name__', 'pure_python') if self.numpy is not None else 'pure_python'
+            cache_material = {'build': SOURCE_BUILD, 'python': sys.version.split()[0],
+                              'backend': backend_name, 'backend_version': getattr(self.numpy, '__version__', None),
+                              'stop_vk': stop_vk, 'target_identity': list(target_identity[1:])}
+            cache_key = hashlib.sha256(json.dumps(cache_material, ensure_ascii=False,
+                sort_keys=True, separators=(',', ':')).encode('utf-8')).hexdigest()
+            previous_profile = {}
+            profile_path = self.folder / 'runtime_profile.json'
+            try:
+                if profile_path.is_file():
+                    loaded_profile = json.loads(profile_path.read_text(encoding='utf-8'))
+                    if isinstance(loaded_profile, dict):
+                        previous_profile = loaded_profile
+            except (OSError, ValueError, TypeError):
+                previous_profile = {}
+            verification_key = (SOURCE_BUILD, str(self.folder.resolve()), backend_name, stop_vk, cache_key)
+            cache_hit = bool(previous_profile.get('offline_regression_verified')
+                             and previous_profile.get('offline_regression_cache_key') == cache_key)
+            if verification_key not in self.regression_verifications and not cache_hit:
                 self.set_status('验证离线学习、输入释放与恢复链路')
                 if not verify_offline_cold_start(self.folder, self.numpy, stop_vk, '窗口',
                                                  target_hwnd, target_identity):
                     raise OSError('离线回归验证未通过')
                 self.regression_verifications.add(verification_key)
-                self.runtime_profile['offline_regression_verified'] = True
-            else:
-                self.runtime_profile['offline_regression_verified'] = True
+            self.runtime_profile['offline_regression_verified'] = True
+            self.runtime_profile['offline_regression_cache_key'] = cache_key
+            self.runtime_profile['offline_regression_cache_hit'] = cache_hit
             self.set_status('验证经验存储')
             try:
                 store = ReplayStore(self.folder)
@@ -18957,6 +19424,8 @@ class App:
                 self.runtime_profile['performance_profile_verified'] = False
                 self.runtime_profile['performance_profile_error'] = f'{type(exc).__name__}: {str(exc)[:180]}'
             self.runtime_profile['runtime_budget_source'] = 'measured_stage_costs_and_device_profile'
+            self.runtime_profile['storage_resource_metrics'] = storage_resource_snapshot(self.folder)
+            self.runtime_profile['input_dispatch_measurement'] = 'windows_low_level_hook_observation_not_game_receipt'
             profile = self.folder / 'runtime_profile.json'
             temporary = self.folder / 'runtime_profile.json.tmp'
             with temporary.open('w', encoding='utf-8') as stream:
@@ -19013,19 +19482,31 @@ class App:
             self.process_window_hwnd = target_hwnd
             self.process_window_identity = target_identity
             self.process_operation = operation
-            if not self.restore_orphaned_inputs():
-                raise OSError('输入状态恢复失败')
+            self.stop_listener = None
+            self.stop_guardian = None
             stop_event = threading.Event()
             gate = StopKeyGate(self.n, stop_vk, stop_event)
             gate.on_stop = lambda: self.n.user.PostMessageW(self.hwnd, WM_APP_STOP_REQUESTED, 0, 0)
-            listener = StopListener(self.n, stop_vk, stop_event, gate, consume_stop_key=operation != 'cultivate')
+            listener = StopListener(self.n, stop_vk, stop_event, gate, input_callback=lambda event: None,
+                                    consume_stop_key=operation != 'cultivate')
             listener.start()
+            self.recovery_listener = listener
+            self.stop_event, self.stop_gate = stop_event, gate
+            if not self.restore_orphaned_inputs():
+                raise OSError('输入状态恢复失败')
+            if stop_event.is_set():
+                listener.close()
+                self.recovery_listener = None
+                self.stop_event = None
+                self.stop_gate = None
+                self.set_status('已停止')
+                return
             guardian = StopGuardian(stop_vk, gate, stop_event, consume_stop_key=operation != 'cultivate')
             try:
                 guardian.start()
             except (OSError, ValueError):
                 pass
-            self.stop_event, self.stop_gate = stop_event, gate
+            self.recovery_listener = None
             self.stop_listener, self.stop_guardian = listener, guardian
             self.worker_restarts = 0
             self.worker_last_returncode = None
@@ -19046,6 +19527,14 @@ class App:
                 listener.close()
             if guardian is not None:
                 guardian.close()
+            if getattr(self, 'recovery_listener', None) is listener:
+                self.recovery_listener = None
+            if getattr(self, 'stop_listener', None) is listener:
+                self.stop_listener = None
+            if getattr(self, 'stop_guardian', None) is guardian:
+                self.stop_guardian = None
+            self.stop_event = None
+            self.stop_gate = None
             if self.pending_release_controller is not None and not self.release_repair_active:
                 self.release_repair_active = True
                 threading.Thread(target=self.repair_release,
@@ -19086,8 +19575,6 @@ class App:
             pass
 
     def restore_orphaned_inputs(self):
-        if getattr(self, 'process_operation', None) == 'cultivate':
-            return True
         ledger = self.folder / 'active_inputs.json'
         if not ledger.exists():
             return True
@@ -19097,6 +19584,28 @@ class App:
             if stop_vk is None:
                 stop_vk = self.chosen_stop_key()
             keys, mouse, touch = normalize_input_ledger(state, stop_vk)
+            listener = getattr(self, 'recovery_listener', None) or getattr(self, 'stop_listener', None)
+            if listener is not None:
+                if (keys or mouse) and not listener.input_monitor_healthy():
+                    raise OSError('无法安全恢复输入状态：物理输入状态监测不可用')
+                physical_keys, physical_mouse = listener.physical_state_snapshot()
+            else:
+                physical_keys, physical_mouse = set(), set()
+            modifier_aliases = {16: {16, 160, 161}, 17: {17, 162, 163}, 18: {18, 164, 165},
+                                160: {16, 160, 161}, 161: {16, 160, 161},
+                                162: {17, 162, 163}, 163: {17, 162, 163},
+                                164: {18, 164, 165}, 165: {18, 164, 165}}
+            preserved_keys = {vk for vk in keys
+                              if (modifier_aliases.get(vk, {vk}) & physical_keys)}
+            physical_mouse_flags = set()
+            if 'left' in physical_mouse:
+                physical_mouse_flags.add(MOUSEEVENTF_LEFTDOWN)
+            if 'right' in physical_mouse:
+                physical_mouse_flags.add(MOUSEEVENTF_RIGHTDOWN)
+            if 'middle' in physical_mouse:
+                physical_mouse_flags.add(MOUSEEVENTF_MIDDLEDOWN)
+            if any(str(button).startswith('x') for button in physical_mouse):
+                physical_mouse_flags.add(MOUSEEVENTF_XDOWN)
             control = Controller(self.n, stop_vk, threading.Event())
             control.ledger_path = ledger
             control.down = keys
@@ -19105,7 +19614,14 @@ class App:
             if control.down or control.mouse_down or control.touch_points:
                 self.worker_input_recoveries += 1
                 self.write_supervisor_state('releasing_inputs')
-            control.release(retries=6)
+            released = control.release(retries=6, preserve_keys=preserved_keys,
+                                       preserve_mouse=physical_mouse_flags)
+            control.down.difference_update(preserved_keys)
+            control.mouse_down.difference_update(physical_mouse_flags)
+            control.journal_inputs()
+            if not released:
+                self.pending_release_controller = control
+                return False
             self.pending_release_controller = None
             return True
         except BaseException as exc:
