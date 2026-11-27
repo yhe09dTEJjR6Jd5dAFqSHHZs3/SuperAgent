@@ -72,6 +72,27 @@ class MEMORYSTATUSEX(ctypes.Structure):
                 ('ullAvailExtendedVirtual', ctypes.c_ulonglong)]
 
 
+class SYSTEM_INFO(ctypes.Structure):
+    _fields_ = [('wProcessorArchitecture', ctypes.c_ushort), ('wReserved', ctypes.c_ushort),
+                ('dwPageSize', ctypes.c_uint32), ('lpMinimumApplicationAddress', ctypes.c_void_p),
+                ('lpMaximumApplicationAddress', ctypes.c_void_p), ('dwActiveProcessorMask', ctypes.c_size_t),
+                ('dwNumberOfProcessors', ctypes.c_uint32), ('dwProcessorType', ctypes.c_uint32),
+                ('dwAllocationGranularity', ctypes.c_uint32), ('wProcessorLevel', ctypes.c_ushort),
+                ('wProcessorRevision', ctypes.c_ushort)]
+
+
+def native_windows_architecture():
+    if os.name != 'nt':
+        return None
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    function = kernel.GetNativeSystemInfo
+    function.argtypes = [ctypes.POINTER(SYSTEM_INFO)]
+    function.restype = None
+    info = SYSTEM_INFO()
+    function(ctypes.byref(info))
+    return int(info.wProcessorArchitecture)
+
+
 def available_physical_memory_bytes():
     if os.name != 'nt':
         return None
@@ -107,16 +128,31 @@ def storage_resource_snapshot(folder):
         total = None
         free = None
     persistent = 0
-    try:
-        with os.scandir(path) as entries:
-            for entry in entries:
-                try:
-                    if not entry.is_symlink() and entry.is_file(follow_symlinks=False):
-                        persistent += int(entry.stat(follow_symlinks=False).st_size)
-                except OSError:
-                    continue
-    except OSError:
-        pass
+    pending = [path]
+    seen_files = set()
+    while pending:
+        current = pending.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_symlink():
+                            continue
+                        if entry.is_dir(follow_symlinks=False):
+                            pending.append(pathlib.Path(entry.path))
+                            continue
+                        if entry.is_file(follow_symlinks=False):
+                            stat = entry.stat(follow_symlinks=False)
+                            identity = (getattr(stat, 'st_dev', None), getattr(stat, 'st_ino', None))
+                            if identity[1] and identity in seen_files:
+                                continue
+                            if identity[1]:
+                                seen_files.add(identity)
+                            persistent += int(stat.st_size)
+                    except OSError:
+                        continue
+        except OSError:
+            continue
     fraction = free / total if free is not None and total is not None and total > 0 else None
     factor = max(0.0, min(1.0, fraction)) if fraction is not None else None
     return {'disk_total_bytes': total, 'disk_free_bytes': free,
@@ -929,10 +965,11 @@ def population_count(value):
     return method() if method is not None else bin(number).count('1')
 
 
-def action_feedback_is_valid(old_rect, new_rect, feedback, tracking_available, user_interference):
-    return bool(tracking_available and not user_interference and old_rect == new_rect
-                and isinstance(feedback, dict) and feedback.get('frame_deltas')
-                and feedback.get('post_action_frame_verified'))
+def action_feedback_is_valid(old_rect, new_rect, feedback, tracking_available, user_interference,
+                             context_changed=False):
+    return bool(tracking_available and not user_interference and not context_changed
+                and old_rect == new_rect and isinstance(feedback, dict)
+                and feedback.get('frame_deltas') and feedback.get('post_action_frame_verified'))
 
 
 def physical_mouse_preserve_state(physical_mouse):
@@ -1434,7 +1471,7 @@ class StopListener:
                         emit = self.emit_injected if injected else self.emit_input
                         if wp == WM_MOUSEMOVE:
                             if injected:
-                                emit({'type': 'mouse_move', 'at': now})
+                                emit({'type': 'mouse_move', 'x': x, 'y': y, 'at': now})
                             elif (self.last_mouse_position != (x, y) and now - self.last_mouse_move_tick >= 0.02):
                                 self.last_mouse_move_tick = now
                                 self.last_mouse_position = (x, y)
@@ -2468,11 +2505,21 @@ class Capture:
 class InputDispatchTracker:
     def __init__(self):
         self.lock = threading.Lock()
-        self.expected_pending = Counter()
-        self.observed_pending = Counter()
+        self.expected_pending = deque()
+        self.observed_pending = deque()
+        self.pending_limit = 8192
         self.expected_total = 0
         self.observed_total = 0
         self.matched_total = 0
+        self.mismatched_total = 0
+        self.pending_dropped = 0
+        self.time_delta_total = 0.0
+        self.time_delta_samples = 0
+        self.time_delta_max = 0.0
+        self.coordinate_error_total = 0.0
+        self.coordinate_error_samples = 0
+        self.coordinate_error_max = 0.0
+        self.last_pair = None
 
     @staticmethod
     def signature(event):
@@ -2487,41 +2534,115 @@ class InputDispatchTracker:
             direction = int(event.get('direction', 0))
             return (kind, bool(event.get('horizontal')), 1 if direction > 0 else -1) if direction else None
         if kind == 'mouse_move':
-            return (kind,)
+            if 'x' in event and 'y' in event:
+                return kind, int(event['x']), int(event['y'])
+            if 'dx' in event and 'dy' in event:
+                return kind, int(event['dx']), int(event['dy'])
+            return None
         return None
 
-    def expected(self, event):
-        signature = self.signature(event)
-        if signature is None:
+    @staticmethod
+    def event_matches(expected, observed):
+        expected_signature = InputDispatchTracker.signature(expected)
+        observed_signature = InputDispatchTracker.signature(observed)
+        if expected_signature is None or observed_signature is None:
+            return False, None
+        if expected_signature[0] != observed_signature[0]:
+            return False, None
+        if expected_signature[0] != 'mouse_move':
+            return expected_signature == observed_signature, None
+        if len(expected_signature) != 3 or len(observed_signature) != 3:
+            return False, None
+        if 'x' in expected and 'y' in expected and 'x' in observed and 'y' in observed:
+            distance = math.hypot(expected_signature[1] - observed_signature[1],
+                                  expected_signature[2] - observed_signature[2])
+            tolerance = max(1.0, float(expected.get('coordinate_tolerance', 1.0)),
+                            float(observed.get('coordinate_tolerance', 1.0)))
+            return distance <= tolerance, distance
+        return expected_signature == observed_signature, None
+
+    @staticmethod
+    def event_time_delta(expected, observed):
+        try:
+            first = float(expected.get('at'))
+            second = float(observed.get('at'))
+            if math.isfinite(first) and math.isfinite(second):
+                return abs(first - second)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            pass
+        return None
+
+    def _append_pending(self, pending, event):
+        if len(pending) >= self.pending_limit:
+            pending.popleft()
+            self.pending_dropped += 1
+        pending.append(dict(event))
+
+    def _record(self, event, expected):
+        if not isinstance(event, dict) or self.signature(event) is None:
             return False
         with self.lock:
-            self.expected_total += 1
-            if self.observed_pending[signature]:
-                self.observed_pending[signature] -= 1
-                self.matched_total += 1
+            if expected:
+                self.expected_total += 1
+                own = self.expected_pending
+                opposite = self.observed_pending
             else:
-                self.expected_pending[signature] += 1
+                self.observed_total += 1
+                own = self.observed_pending
+                opposite = self.expected_pending
+            if opposite:
+                paired = opposite.popleft()
+                expected_event, observed_event = (dict(event), paired) if expected else (paired, dict(event))
+                matched, coordinate_error = self.event_matches(expected_event, observed_event)
+                if matched:
+                    self.matched_total += 1
+                else:
+                    self.mismatched_total += 1
+                time_delta = self.event_time_delta(expected_event, observed_event)
+                if time_delta is not None:
+                    self.time_delta_total += time_delta
+                    self.time_delta_samples += 1
+                    self.time_delta_max = max(self.time_delta_max, time_delta)
+                if coordinate_error is not None:
+                    self.coordinate_error_total += coordinate_error
+                    self.coordinate_error_samples += 1
+                    self.coordinate_error_max = max(self.coordinate_error_max, coordinate_error)
+                self.last_pair = {
+                    'matched': bool(matched),
+                    'expected': self.signature(expected_event),
+                    'observed': self.signature(observed_event),
+                    'absolute_time_delta_seconds': time_delta,
+                    'coordinate_error_pixels': coordinate_error,
+                }
+            else:
+                self._append_pending(own, event)
         return True
 
+    def expected(self, event):
+        return self._record(event, True)
+
     def observed(self, event):
-        signature = self.signature(event)
-        if signature is None:
-            return False
-        with self.lock:
-            self.observed_total += 1
-            if self.expected_pending[signature]:
-                self.expected_pending[signature] -= 1
-                self.matched_total += 1
-            else:
-                self.observed_pending[signature] += 1
-        return True
+        return self._record(event, False)
 
     def snapshot(self):
         with self.lock:
-            return {'expected': self.expected_total, 'observed': self.observed_total,
-                    'matched': self.matched_total,
-                    'pending_expected': sum(self.expected_pending.values()),
-                    'pending_observed': sum(self.observed_pending.values())}
+            return {
+                'expected': self.expected_total,
+                'observed': self.observed_total,
+                'matched': self.matched_total,
+                'mismatched': self.mismatched_total,
+                'pending_expected': len(self.expected_pending),
+                'pending_observed': len(self.observed_pending),
+                'pending_dropped': self.pending_dropped,
+                'mean_absolute_event_time_delta_seconds': (
+                    self.time_delta_total / self.time_delta_samples if self.time_delta_samples else None),
+                'maximum_absolute_event_time_delta_seconds': self.time_delta_max if self.time_delta_samples else None,
+                'mean_mouse_coordinate_error_pixels': (
+                    self.coordinate_error_total / self.coordinate_error_samples if self.coordinate_error_samples else None),
+                'maximum_mouse_coordinate_error_pixels': (
+                    self.coordinate_error_max if self.coordinate_error_samples else None),
+                'last_pair': self.last_pair,
+            }
 
 
 class WindowsSendInputBackend:
@@ -2672,7 +2793,26 @@ class Controller:
             flags = int(data.dwFlags)
             value = int(data.mouseData)
             if flags & MOUSEEVENTF_MOVE:
-                return {'type': 'mouse_move'}
+                if flags & MOUSEEVENTF_ABSOLUTE:
+                    virtual = bool(flags & 0x4000)
+                    if virtual:
+                        left = int(self.n.user.GetSystemMetrics(76))
+                        top = int(self.n.user.GetSystemMetrics(77))
+                        width = int(self.n.user.GetSystemMetrics(78))
+                        height = int(self.n.user.GetSystemMetrics(79))
+                    else:
+                        left = 0
+                        top = 0
+                        width = int(self.n.user.GetSystemMetrics(0))
+                        height = int(self.n.user.GetSystemMetrics(1))
+                    width = max(1, width)
+                    height = max(1, height)
+                    x = left + int(round(int(data.dx) * max(0, width - 1) / 65535.0))
+                    y = top + int(round(int(data.dy) * max(0, height - 1) / 65535.0))
+                    tolerance = max(1.0, max(width, height) / 65535.0)
+                    return {'type': 'mouse_move', 'x': x, 'y': y,
+                            'coordinate_tolerance': tolerance}
+                return {'type': 'mouse_move', 'dx': int(data.dx), 'dy': int(data.dy)}
             if flags & (MOUSEEVENTF_LEFTDOWN | MOUSEEVENTF_LEFTUP):
                 return {'type': 'mouse_button', 'button': 'left', 'down': bool(flags & MOUSEEVENTF_LEFTDOWN)}
             if flags & (MOUSEEVENTF_RIGHTDOWN | MOUSEEVENTF_RIGHTUP):
@@ -3491,13 +3631,58 @@ def quarantine_corrupt_store(folder, failure):
     if not isinstance(failure, sqlite3.DatabaseError) or not any(word in str(failure).lower() for word in words):
         return False
     stamp = str(time.time_ns())
-    moved = False
-    for suffix in ('', '-wal', '-shm'):
-        source = folder / ('experience.sqlite3' + suffix)
-        if source.exists():
-            source.replace(folder / ('experience.sqlite3' + suffix + '.corrupt.' + stamp))
-            moved = True
-    return moved
+    moved = []
+    try:
+        for suffix in ('', '-wal', '-shm'):
+            original = pathlib.Path(folder) / ('experience.sqlite3' + suffix)
+            if original.exists():
+                destination = original.with_name(original.name + '.corrupt.' + stamp)
+                os.replace(original, destination)
+                moved.append((destination, original))
+    except OSError:
+        for destination, original in reversed(moved):
+            try:
+                os.replace(destination, original)
+            except OSError:
+                pass
+        return False
+    return bool(moved)
+
+
+def archive_existing_file(path, reason='preserved'):
+    path = pathlib.Path(path)
+    if not path.is_file():
+        return None
+    destination = path.with_name(path.name + '.' + str(reason) + '.' + str(time.time_ns()))
+    os.replace(path, destination)
+    return destination
+
+
+def archive_incompatible_store(folder, failure):
+    markers = ('经验库并非当前版本数据', '经验库数据结构与当前版本不匹配',
+               '关键帧数据结构与当前版本不匹配', '经验库包含非当前版本样本')
+    if not isinstance(failure, ValueError) or not any(marker in str(failure) for marker in markers):
+        return None
+    folder = pathlib.Path(folder)
+    stamp = str(time.time_ns())
+    source_base = folder / 'experience.sqlite3'
+    archive_base = folder / ('experience.incompatible.' + stamp + '.sqlite3')
+    moved = []
+    try:
+        for suffix in ('', '-wal', '-shm'):
+            original = pathlib.Path(str(source_base) + suffix)
+            if original.exists():
+                destination = pathlib.Path(str(archive_base) + suffix)
+                os.replace(original, destination)
+                moved.append((destination, original))
+    except OSError:
+        for destination, original in reversed(moved):
+            try:
+                os.replace(destination, original)
+            except OSError:
+                pass
+        return None
+    return archive_base if moved else None
 
 
 class ReplayStore:
@@ -3505,6 +3690,9 @@ class ReplayStore:
         self.folder = pathlib.Path(folder)
         self.database_path = self.folder / 'experience.sqlite3'
         self.capacity_frames_skipped = 0
+        self.capacity_deferred_batches = 0
+        self.storage_bytes_per_transition = None
+        self.storage_footprint_bytes = 0
         self.db = sqlite3.connect(str(self.database_path), timeout=12)
         try:
             existing_tables = {row[0] for row in self.db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
@@ -3544,6 +3732,12 @@ class ReplayStore:
             self.start_frame_count = int(self.db.execute('SELECT COUNT(*) FROM keyframes').fetchone()[0])
             self.total_transitions = int(self.db.execute('SELECT COUNT(*) FROM transitions').fetchone()[0])
             self.first_commit_verified = self.total_transitions > 0
+            average = self.db.execute(
+                'SELECT AVG(length(before)+length(after)+length(action_detail)+length(game)+length(action)) FROM transitions'
+            ).fetchone()[0]
+            if average is not None and math.isfinite(float(average)) and float(average) > 0.0:
+                self.storage_bytes_per_transition = float(average)
+            self.storage_footprint_bytes = self.storage_footprint()
         except Exception:
             self.db.close()
             raise
@@ -3560,7 +3754,60 @@ class ReplayStore:
             raise ValueError('经验样本版本或特征长度不匹配')
         return list(struct.unpack('<' + 'f' * FEATURE_COUNT, raw))
 
+    def storage_footprint(self):
+        total = 0
+        for candidate in (self.database_path, pathlib.Path(str(self.database_path) + '-wal'),
+                          pathlib.Path(str(self.database_path) + '-shm')):
+            try:
+                total += int(candidate.stat().st_size)
+            except OSError:
+                pass
+        return total
+
+    def page_size(self):
+        try:
+            value = int(self.db.execute('PRAGMA page_size').fetchone()[0])
+            return max(1, value)
+        except (sqlite3.Error, TypeError, ValueError, IndexError):
+            return 1
+
+    def sidecar_bytes(self):
+        total = 0
+        for candidate in (pathlib.Path(str(self.database_path) + '-wal'),
+                          pathlib.Path(str(self.database_path) + '-shm')):
+            try:
+                total += int(candidate.stat().st_size)
+            except OSError:
+                pass
+        return total
+
+    def estimated_batch_bytes(self, entries):
+        payload = 0
+        for entry in entries:
+            payload += (len(bytes(entry[4])) + len(bytes(entry[5]))
+                        + len(str(entry[11]).encode('utf-8'))
+                        + len(str(entry[1]).encode('utf-8'))
+                        + len(str(entry[2]).encode('utf-8'))
+                        + len(str(entry[12]).encode('ascii', errors='ignore')))
+        page = self.page_size()
+        measured = ((self.storage_bytes_per_transition or 0.0) * len(entries))
+        estimated = max(float(payload), float(measured))
+        allocated = max(page, int(math.ceil(estimated / page)) * page)
+        return int(math.ceil(estimated + allocated))
+
+    def ensure_capacity(self, estimated_bytes):
+        free = available_disk_bytes(self.folder)
+        if free is None:
+            return True
+        page = self.page_size()
+        required = max(0, int(estimated_bytes)) + self.sidecar_bytes() + page
+        if free <= required:
+            self.capacity_deferred_batches += 1
+            raise OSError(f'磁盘可用空间不足，当前经验批次预计需要 {required} 字节；待写经验保留在队列中')
+        return True
+
     def verify_roundtrip(self):
+        self.ensure_capacity(self.page_size() * 2)
         before = [float(i % 13) / 13.0 for i in range(FEATURE_COUNT)]
         after = [float((i + 1) % 13) / 13.0 for i in range(FEATURE_COUNT)]
         marker = 'preflight:' + hashlib.sha256(os.urandom(16)).hexdigest()
@@ -3610,6 +3857,9 @@ class ReplayStore:
             after_uid = str(detail.get('after_frame_uid') or '')[:80]
             signal_kind = effect_flag + 2 * surprising + 4 * controlling + (8 if supported_goal_training([None, None, None, reward, None, priority, done, horizon, confidence, detail])[1] >= 0.20 else 0)
             entries.append((timestamp, canonical_game_key(game), action, float(reward), sqlite3.Binary(self.pack(before)), sqlite3.Binary(self.pack(after)), float(change), int(done), int(horizon), max(0.01, float(priority)), max(0.0, min(1.0, float(confidence))), encoded, uid, MODEL_FORMAT, signal_kind, max(-1.0, min(1.0, objective)), max(-1.0, min(1.0, information)), before_uid, after_uid))
+        estimated_write_bytes = self.estimated_batch_bytes(entries)
+        self.ensure_capacity(estimated_write_bytes)
+        footprint_before = self.storage_footprint()
         try:
             cursor = self.db.executemany('INSERT INTO transitions(at,game,action,reward,before,after,change,done,horizon,priority,confidence,action_detail,uid,feature_version,signal_kind,objective_signal,information_signal,before_frame_uid,after_frame_uid) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(uid) DO NOTHING', entries)
             inserted = cursor.rowcount
@@ -3632,6 +3882,19 @@ class ReplayStore:
             self.db.rollback()
             raise
         self.total_transitions += inserted
+        footprint_after = self.storage_footprint()
+        if inserted > 0:
+            payload_per_row = sum(
+                len(bytes(entry[4])) + len(bytes(entry[5])) + len(str(entry[11]).encode('utf-8'))
+                + len(str(entry[1]).encode('utf-8')) + len(str(entry[2]).encode('utf-8'))
+                for entry in entries
+            ) / max(1, len(entries))
+            observed_per_row = max(0.0, float(footprint_after - footprint_before)) / inserted
+            measured_per_row = max(payload_per_row, observed_per_row)
+            self.storage_bytes_per_transition = (
+                measured_per_row if self.storage_bytes_per_transition is None
+                else 0.82 * self.storage_bytes_per_transition + 0.18 * measured_per_row)
+        self.storage_footprint_bytes = footprint_after
         self.pending = 0
         self.last_commit = time.monotonic()
         return inserted
@@ -3648,11 +3911,10 @@ class ReplayStore:
         uid = str(getattr(obs, 'frame_uid', '')) or hashlib.sha256(compressed + str(game).encode() + str(step).encode() + str(action).encode()).hexdigest()
         free_bytes = available_disk_bytes(self.folder)
         if free_bytes is not None:
-            try:
-                page_size = max(0, int(self.db.execute('PRAGMA page_size').fetchone()[0]))
-            except (sqlite3.Error, TypeError, ValueError, IndexError):
-                page_size = 0
-            if free_bytes <= len(compressed) + page_size:
+            page_size = self.page_size()
+            allocation = len(compressed) + max(page_size, int(math.ceil(len(compressed) / page_size)) * page_size)
+            required = allocation + self.sidecar_bytes() + page_size
+            if free_bytes <= required:
                 self.capacity_frames_skipped += 1
                 return False
         result = self.db.execute('INSERT INTO keyframes(at,game,step,action,signature,valid,width,height,frame,uid) VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(uid) DO NOTHING', (time.time(), canonical_game_key(game), int(step), action, obs.signature, int(obs.valid), W, H, sqlite3.Binary(compressed), uid))
@@ -3701,6 +3963,7 @@ class ReplayStore:
         return output
 
     def mark_terminal_uid(self, uid):
+        self.ensure_capacity(self.page_size() * 2)
         result = self.db.execute('UPDATE transitions SET done=1 WHERE uid=? AND horizon=1', (uid,))
         self.db.commit()
         self.last_commit = time.monotonic()
@@ -4678,6 +4941,8 @@ class Brain:
         self.last_checkpoint_summary = {}
         self.checkpoint_compressed_bytes = 0
         self.delta_base_step = None
+        self.checkpoint_file_status = {}
+        self.delta_restore_valid = False
         self.dirty_games = set()
         self.dirty_sequence = 0
         self.store_roundtrip_verified = False
@@ -11793,11 +12058,20 @@ class Brain:
                     except Exception:
                         pass
                 self.store = None
+            archived = None
             if quarantine_corrupt_store(self.folder, exc):
+                archived = 'corrupt'
+            else:
+                archived_path = archive_incompatible_store(self.folder, exc)
+                if archived_path is not None:
+                    archived = archived_path.name
+            if archived is not None:
                 try:
                     self.store = ReplayStore(self.folder)
                     self.db_preflight_verified = self.store.verify_roundtrip()
-                    self.store_problem = '已隔离损坏的经验数据库，原数据文件保存在工作目录内'
+                    self.store_problem = ('已隔离损坏的经验数据库，原数据文件已保留'
+                                          if archived == 'corrupt'
+                                          else f'经验数据库版本不兼容，旧数据已保留：{archived}')
                     self.store_failures = 0
                     self.store_reconnect_at = 0.0
                     self.db_transitions_last_known = self.store.total_transitions
@@ -11955,7 +12229,11 @@ class Brain:
 
     def storage_metrics_snapshot(self):
         with self.storage_metrics_lock:
-            return dict(self.storage_metrics)
+            snapshot = dict(self.storage_metrics)
+        store = self.store
+        snapshot['storage_capacity_deferred_batches'] = (
+            store.capacity_deferred_batches if store is not None else 0)
+        return snapshot
 
     def refresh_storage_metrics(self):
         now = time.monotonic()
@@ -11982,6 +12260,8 @@ class Brain:
             current['storage_growth_bytes_per_second'] = growth
             current['estimated_time_to_full_seconds'] = (float(free) / growth
                 if free is not None and growth > 0.0 else None)
+            current['storage_capacity_deferred_batches'] = (
+                self.store.capacity_deferred_batches if self.store is not None else 0)
             self.storage_metrics = current
             self.storage_metrics_last_sample = now
             return dict(current)
@@ -13031,7 +13311,8 @@ class Brain:
         now = time.monotonic()
         path = self.folder / 'learning_state.json.gz'
         delta_path = self.folder / 'learning_delta.json.gz'
-        delta_mode = (path.exists() and self.delta_base_step is not None
+        delta_mode = (path.exists() and self.checkpoint_file_status.get(path.name) == 'valid'
+                      and self.delta_base_step is not None
                       and not self.storage_stop.is_set() and self.checkpoint_serial % 5 != 4)
         with self.lock:
             snapshot_revision = self.dirty_sequence
@@ -13063,33 +13344,36 @@ class Brain:
                 if hashlib.sha256(verify.read()).digest() != hashlib.sha256(serialized).digest():
                     raise OSError('新建学习状态的回读校验失败')
             if delta_mode:
+                if delta_path.exists() and not self.delta_restore_valid:
+                    archive_existing_file(delta_path, 'preserved')
                 os.replace(temp, delta_path)
+                self.checkpoint_file_status[delta_path.name] = 'valid'
+                self.delta_restore_valid = True
             else:
-                if path.exists() and (self.checkpoint_serial % 6 == 0 or not backup.exists()):
-                    try:
-                        if path.stat().st_size > 140_000_000:
-                            raise ValueError('旧检查点容量超限')
-                        with gzip.open(path, 'rb') as old_stream:
-                            old_raw = old_stream.read(260_000_001)
-                        if len(old_raw) > 260_000_000:
-                            raise ValueError('旧检查点解压容量超限')
-                        old_payload = json.loads(old_raw)
-                        old_digest = old_payload.pop('integrity_sha256', None)
-                        if (old_payload.get('format') != MODEL_FORMAT
-                                or old_payload.get('feature_count') != FEATURE_COUNT
-                                or old_payload.get('hidden_size') != MODEL_HIDDEN_SIZE
-                                or not isinstance(old_digest, str)):
-                            raise ValueError('仅允许备份当前版本的完整检查点')
-                        if old_digest is not None:
-                            old_bytes = json.dumps(old_payload, ensure_ascii=False, separators=(',', ':'), allow_nan=False).encode('utf-8')
-                            if hashlib.sha256(old_bytes).hexdigest() != old_digest:
-                                raise ValueError('旧检查点哈希错误')
-                        shutil.copyfile(path, backup_temp)
-                        os.replace(backup_temp, backup)
-                    except (OSError, ValueError, TypeError, EOFError, gzip.BadGzipFile):
-                        pass
+                primary_status = self.checkpoint_file_status.get(path.name, 'missing')
+                backup_status = self.checkpoint_file_status.get(backup.name, 'missing')
+                if backup.exists() and backup_status != 'valid':
+                    archive_existing_file(backup, 'preserved')
+                    backup_status = 'missing'
+                if path.exists() and primary_status != 'valid':
+                    archive_existing_file(path, 'preserved')
+                elif path.exists() and (self.checkpoint_serial % 6 == 0 or not backup.exists()):
+                    shutil.copyfile(path, backup_temp)
+                    with backup_temp.open('rb+') as backup_stream:
+                        backup_stream.flush()
+                        os.fsync(backup_stream.fileno())
+                    os.replace(backup_temp, backup)
+                    backup_status = 'valid'
                 os.replace(temp, path)
-                delta_path.unlink(missing_ok=True)
+                if delta_path.exists():
+                    if not self.delta_restore_valid:
+                        archive_existing_file(delta_path, 'preserved')
+                    else:
+                        delta_path.unlink(missing_ok=True)
+                self.checkpoint_file_status[path.name] = 'valid'
+                self.checkpoint_file_status[backup.name] = backup_status if backup.exists() else 'missing'
+                self.checkpoint_file_status[delta_path.name] = 'missing'
+                self.delta_restore_valid = False
             with self.lock:
                 self.last_checkpoint_summary = {
                     'step': int(payload['step']), 'updates': int(payload['updates']),
@@ -13135,9 +13419,13 @@ class Brain:
             return value if isinstance(value, list) else []
         saved = None
         last_error = None
+        self.checkpoint_file_status = {primary.name: 'missing', backup.name: 'missing'}
+        self.checkpoint_file_status['learning_delta.json.gz'] = 'missing'
+        self.delta_restore_valid = False
         for filename in (primary, backup):
             if not filename.exists():
                 continue
+            self.checkpoint_file_status[filename.name] = 'invalid'
             try:
                 if filename.stat().st_size > 140_000_000:
                     raise ValueError('学习状态压缩文件过大')
@@ -13159,18 +13447,22 @@ class Brain:
                         or entry.get('hidden_size') != MODEL_HIDDEN_SIZE):
                     raise ValueError('学习状态版本或维度不受支持')
                 saved = entry
+                self.checkpoint_file_status[filename.name] = 'valid'
                 self.checkpoint_verified = True
                 if filename == backup:
                     self.store_problem = '主学习状态无法恢复，已从备份恢复'
                 break
             except (ValueError, TypeError, OSError, EOFError, gzip.BadGzipFile) as exc:
                 last_error = exc
+                self.checkpoint_file_status[filename.name] = (
+                    'incompatible' if '版本或维度不受支持' in str(exc) else 'invalid')
         if saved is None:
             self.store_problem = f'学习状态恢复失败：{last_error}'
             return
         self.delta_base_step = int(saved.get('step', 0))
         delta_path = self.folder / 'learning_delta.json.gz'
         if delta_path.exists():
+            self.checkpoint_file_status[delta_path.name] = 'invalid'
             try:
                 if delta_path.stat().st_size > 80_000_000:
                     raise ValueError('增量学习文件过大')
@@ -13189,6 +13481,8 @@ class Brain:
                         or not isinstance(delta.get('games'), dict)
                         or int(delta.get('step', -1)) < self.delta_base_step):
                     raise ValueError('增量学习状态与基础检查点不匹配')
+                self.checkpoint_file_status[delta_path.name] = 'valid'
+                self.delta_restore_valid = True
                 for key, value in delta.items():
                     if key not in ('format', 'base_model_format', 'base_step', 'games', 'integrity_sha256'):
                         saved[key] = value
@@ -13198,6 +13492,8 @@ class Brain:
                         stored.update(data)
                         self.dirty_games.add(stable_game_key(key))
             except (OSError, ValueError, TypeError, EOFError, gzip.BadGzipFile, KeyError, AttributeError) as exc:
+                self.checkpoint_file_status[delta_path.name] = (
+                    'incompatible' if '不匹配' in str(exc) or 'base_model_format' in str(exc) else 'invalid')
                 self.store_problem = f'增量学习状态未采用，继续使用完整检查点：{type(exc).__name__}: {exc}'
         def feature_vector(value, limit=3.0):
             return vector(value, FEATURE_COUNT, limit)
@@ -13769,6 +14065,7 @@ class GameAgent:
         self.physical_input_generation = 0
         self.action_physical_input_generation = 0
         self.action_user_interference = False
+        self.action_context_changed = False
         self.physical_input_overflow = False
         self.physical_input_overflow_pending = False
         self.physical_input_tracking_available = False
@@ -14600,7 +14897,7 @@ class GameAgent:
             with self.physical_input_lock:
                 if self.physical_input_generation != self.action_physical_input_generation:
                     self.action_user_interference = True
-                    return True
+                    self.action_physical_input_generation = self.physical_input_generation
         with self.sensor_condition:
             frame = self.sensor_frame
         if (frame is None or frame[3] <= self.last_sensor_sequence or old.raw is None
@@ -15131,25 +15428,13 @@ class GameAgent:
                                 + abs(obs.raw[i * 4 + 1] - current_raw[i * 4 + 1])
                                 + abs(obs.raw[i * 4 + 2] - current_raw[i * 4 + 2])
                                 for i in positions) / (max(1, len(positions)) * 765.0)
-                        if (pre_action_visual_change > max(0.095, self.brain.game.passive_change * 3.5)
-                                and latest_before_input is not None and latest_before_input[1] == rect
-                                and latest_before_input[3] > self.last_sensor_sequence):
-                            refreshed = self.brain.observe(latest_before_input[0], rect)
-                            self.last_sensor_sequence = latest_before_input[3]
-                            self.last_visual_target_count = len(refreshed.attention_points)
-                            self.last_capture_valid = refreshed.valid
-                            self.last_observation_quality = refreshed.quality
-                            self.last_signature = refreshed.signature
-                            self.note_frame_quality(refreshed.quality)
-                            obs = refreshed
-                            plan.clear()
-                            plan_parameters.clear()
-                            plan_predictions.clear()
-                            continue
+                        changed_before_action = False
                         if self.operation == 'agent' and self.physical_input_tracking_available:
                             self.drain_agent_physical_events()
                             with self.physical_input_lock:
                                 changed_before_action = self.physical_input_generation != pre_action_input_generation
+                                if changed_before_action:
+                                    pre_action_input_generation = self.physical_input_generation
                             if changed_before_action:
                                 with self.sensor_condition:
                                     latest = self.sensor_frame
@@ -15165,8 +15450,8 @@ class GameAgent:
                                 plan.clear()
                                 plan_parameters.clear()
                                 plan_predictions.clear()
-                                continue
-                        self.action_user_interference = False
+                        self.action_user_interference = bool(changed_before_action)
+                        self.action_context_changed = False
                         self.action_physical_input_generation = pre_action_input_generation
                         dispatch_before = self.input_dispatch_tracker.snapshot()
                         self.monitor_candidate_sequence = -1
@@ -15245,13 +15530,19 @@ class GameAgent:
                         action_detail['input_dispatch_matched_by_low_level_hook'] = dispatch_after['matched'] - dispatch_before['matched']
                         action_detail['input_dispatch_pending_expected'] = dispatch_after['pending_expected']
                         action_detail['input_dispatch_pending_observed'] = dispatch_after['pending_observed']
+                        action_detail['input_dispatch_mismatched'] = dispatch_after['mismatched'] - dispatch_before['mismatched']
+                        action_detail['input_dispatch_pending_dropped'] = dispatch_after['pending_dropped']
+                        action_detail['input_dispatch_mean_absolute_event_time_delta_seconds'] = dispatch_after['mean_absolute_event_time_delta_seconds']
+                        action_detail['input_dispatch_maximum_absolute_event_time_delta_seconds'] = dispatch_after['maximum_absolute_event_time_delta_seconds']
+                        action_detail['input_dispatch_mean_mouse_coordinate_error_pixels'] = dispatch_after['mean_mouse_coordinate_error_pixels']
+                        action_detail['input_dispatch_maximum_mouse_coordinate_error_pixels'] = dispatch_after['maximum_mouse_coordinate_error_pixels']
                         action_detail['user_observed_action_support'] = self.brain.observed_user_action_support(
                             self.brain.game, action_index) if self.brain is not None else 0.0
                         action_detail['game_input_received_verified'] = None
                         action_detail['game_input_receipt_proven'] = False
                         action_detail['feedback_valid'] = action_feedback_is_valid(
                             rect, newrect, feedback, self.physical_input_tracking_available,
-                            self.action_user_interference)
+                            self.action_user_interference, self.action_context_changed)
                         if not self.physical_input_tracking_available:
                             action_detail['feedback_validation_reason'] = 'physical_input_tracking_unavailable'
                         elif self.action_user_interference:
@@ -15794,8 +16085,8 @@ def profile_runtime(folder, module, capture_seconds=None, stop_vk=27, live_frame
                 if not selected or not all(0 <= index < len(complete.actions) for index in selected):
                     raise ArithmeticError('完整规划基准返回了无效动作')
             ordered = sorted(samples)
+            result['complete_plan_sample_count'] = len(ordered)
             result['complete_plan_p50_milliseconds'] = round(ordered[len(ordered) // 2], 3)
-            result['complete_plan_p95_milliseconds'] = round(ordered[max(0, math.ceil(len(ordered) * 0.95) - 1)], 3)
             result['complete_plan_max_milliseconds'] = round(ordered[-1], 3)
             changed = bytearray(textured)
             for index in range(0, W * H, 17):
@@ -17856,6 +18147,19 @@ tracker.observed({'type': 'mouse_button', 'button': 'left', 'down': True})
 tracker_state = tracker.snapshot()
 assert tracker_state['expected'] == 1 and tracker_state['observed'] == 2
 assert tracker_state['matched'] == 1 and tracker_state['pending_observed'] == 1
+precision_tracker = engine.InputDispatchTracker()
+precision_tracker.expected({'type': 'mouse_move', 'x': 100, 'y': 200, 'coordinate_tolerance': 1, 'at': 1.0})
+precision_tracker.observed({'type': 'mouse_move', 'x': 101, 'y': 200, 'at': 1.01})
+precision_tracker.expected({'type': 'key', 'vk': 65, 'down': False, 'at': 2.0})
+precision_tracker.observed({'type': 'key', 'vk': 66, 'down': False, 'at': 2.02})
+precision_state = precision_tracker.snapshot()
+assert precision_state['matched'] == 1 and precision_state['mismatched'] == 1
+assert precision_state['maximum_mouse_coordinate_error_pixels'] == 1.0
+assert precision_state['mean_absolute_event_time_delta_seconds'] is not None
+assert engine.action_feedback_is_valid((0, 0, 1, 1), (0, 0, 1, 1),
+    {'frame_deltas': [0.1], 'post_action_frame_verified': True}, True, False)
+assert not engine.action_feedback_is_valid((0, 0, 1, 1), (0, 0, 1, 1),
+    {'frame_deltas': [0.1], 'post_action_frame_verified': True}, True, False, True)
 assert engine.temporal_response_confidence([0.06, 0.07, 0.068], [0.01, 0.005], 0.002, 0.95) > engine.temporal_response_confidence([0.06, 0.08, 0.008], [0.07, 0.07], 0.01, 0.10)
 class WorkerIdentity:
     pid = 12345
@@ -18226,12 +18530,46 @@ scan_probe = workspace / 'storage_scan_probe'
 (scan_probe / 'nested').mkdir(parents=True)
 (scan_probe / 'root.bin').write_bytes(b'root')
 (scan_probe / 'nested' / 'deep.bin').write_bytes(b'x' * 4096)
-assert engine.storage_resource_snapshot(scan_probe)['persistent_data_bytes'] == 4
+assert engine.storage_resource_snapshot(scan_probe)['persistent_data_bytes'] == 4100
 resource_snapshot = engine.storage_resource_snapshot(workspace)
 assert 0.0 <= resource_snapshot['storage_capacity_factor'] <= 1.0
 assert resource_snapshot['persistent_data_bytes'] >= 0
 if resource_snapshot['disk_total_bytes'] and resource_snapshot['disk_free_bytes'] is not None:
     assert abs(resource_snapshot['storage_capacity_factor'] - resource_snapshot['disk_free_bytes'] / resource_snapshot['disk_total_bytes']) < 1e-9
+version_probe = workspace / 'version_probe'
+version_probe.mkdir()
+version_db = version_probe / 'experience.sqlite3'
+version_connection = engine.sqlite3.connect(str(version_db))
+version_connection.execute('CREATE TABLE transitions (id INTEGER)')
+version_connection.execute('PRAGMA user_version=' + str(engine.MODEL_FORMAT - 1))
+version_connection.commit()
+version_connection.close()
+try:
+    engine.ReplayStore(version_probe)
+    raise AssertionError('incompatible experience database was accepted')
+except ValueError as version_error:
+    preserved_store = engine.archive_incompatible_store(version_probe, version_error)
+    assert preserved_store is not None and preserved_store.exists() and not version_db.exists()
+fresh_store = engine.ReplayStore(version_probe)
+assert fresh_store.db.execute('PRAGMA user_version').fetchone()[0] == engine.MODEL_FORMAT
+fresh_store.close()
+capacity_probe = workspace / 'capacity_probe'
+capacity_probe.mkdir()
+capacity_store = engine.ReplayStore(capacity_probe)
+original_disk_probe = engine.available_disk_bytes
+engine.available_disk_bytes = lambda folder: 0
+try:
+    capacity_row = ('capacity-probe', 'wait', 0.0, [0.0] * engine.FEATURE_COUNT,
+                    [0.1] * engine.FEATURE_COUNT, 0.0, 0, 1, 0.1, 0.5,
+                    {'uid': 'capacity-probe-00000001'})
+    try:
+        capacity_store.add_many([capacity_row])
+        raise AssertionError('storage capacity guard did not defer the batch')
+    except OSError:
+        assert capacity_store.total_transitions == 0
+finally:
+    engine.available_disk_bytes = original_disk_probe
+    capacity_store.close()
 agent = engine.Brain(workspace, stop_vk, numeric)
 try:
     resource_metrics = agent.refresh_storage_metrics()
@@ -19339,7 +19677,7 @@ def supervisor_stall_reason(snapshot, now, born, last_heartbeat, last_input, las
     profile = runtime_profile if isinstance(runtime_profile, dict) else {}
     performance = profile.get('performance') if isinstance(profile.get('performance'), dict) else {}
     try:
-        plan_milliseconds = max(float(performance.get('complete_plan_p95_milliseconds') or 0.0),
+        plan_milliseconds = max(float(performance.get('complete_plan_max_milliseconds') or 0.0),
                                 float(performance.get('real_screen_plan_p50_milliseconds') or 0.0),
                                 float(performance.get('complete_visual_observation_milliseconds') or 0.0))
         if not math.isfinite(plan_milliseconds) or plan_milliseconds < 0.0:
@@ -19468,12 +19806,81 @@ def run_agent_subprocess(configuration):
         heartbeat_exit = threading.Event()
         shutdown_complete = threading.Event()
         heartbeat_interval = 2.0
+        blackbox_request_path = folder / 'blackbox_request.json'
+        blackbox_result_path = folder / 'blackbox_result.json'
+        blackbox_request_lock = threading.Lock()
+        blackbox_request_state = {'id': None, 'thread': None, 'started_at': None}
+
+        def write_blackbox_result(request_id, result):
+            temporary = folder / ('blackbox_result_' + request_id + '.tmp')
+            try:
+                with temporary.open('w', encoding='utf-8') as stream:
+                    json.dump(result, stream, ensure_ascii=False, separators=(',', ':'), allow_nan=False)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, blackbox_result_path)
+            except OSError:
+                temporary.unlink(missing_ok=True)
+
+        def create_blackbox_snapshot(request_id, requested_agent):
+            com_ready = False
+            result = {'request_id': request_id, 'ok': False}
+            try:
+                com_ready = native.ole.CoInitializeEx(None, 2) in (0, 1)
+                brain = requested_agent.brain if requested_agent is not None else None
+                if brain is not None and not brain.storage_stop.is_set():
+                    brain.save(force=True)
+                path = blackbox(native, folder, requested_agent, mode, stop_vk, target_identity, operation)
+                size = int(path.stat().st_size)
+                if size > 1_000_000:
+                    raise OSError('黑匣子超过 1MB，未交付')
+                result.update({'ok': True, 'name': path.name, 'size': size})
+            except BaseException as exc:
+                result['error'] = f'{type(exc).__name__}: {str(exc)[:240]}'
+            finally:
+                if com_ready:
+                    try:
+                        native.ole.CoUninitialize()
+                    except Exception:
+                        pass
+                write_blackbox_result(request_id, result)
+
+        def check_blackbox_request():
+            try:
+                if not blackbox_request_path.is_file() or blackbox_request_path.stat().st_size > 4096:
+                    return
+                request = json.loads(blackbox_request_path.read_text(encoding='utf-8'))
+                request_id = request.get('request_id') if isinstance(request, dict) else None
+                if (not isinstance(request_id, str) or len(request_id) != 32
+                        or any(character not in '0123456789abcdef' for character in request_id)
+                        or request.get('session') != session):
+                    return
+                with blackbox_request_lock:
+                    current_thread = blackbox_request_state.get('thread')
+                    if request_id == blackbox_request_state.get('id'):
+                        return
+                    if current_thread is not None and current_thread.is_alive():
+                        return
+                    requested_agent = agent
+                    worker = threading.Thread(target=create_blackbox_snapshot,
+                                              args=(request_id, requested_agent),
+                                              name='AgentBlackboxSnapshot', daemon=True)
+                    blackbox_request_state['id'] = request_id
+                    blackbox_request_state['thread'] = worker
+                    blackbox_request_state['started_at'] = time.monotonic()
+                    worker.start()
+            except Exception:
+                pass
+
         def publish_heartbeat():
             path = folder / 'worker_heartbeat.json'
             temporary = folder / ('worker_heartbeat_' + session + '.tmp')
             while not heartbeat_exit.is_set():
                 now = time.monotonic()
+                check_blackbox_request()
                 controller = agent.controller
+                blackbox_thread = blackbox_request_state.get('thread')
+                blackbox_started = blackbox_request_state.get('started_at')
                 state = {'build': SOURCE_BUILD, 'session': session, 'pid': os.getpid(), 'at': time.time(),
                          'phase': agent.phase, 'operation': agent.operation, 'activity_tick': agent.activity_tick,
                          'shutdown_complete': shutdown_complete.is_set(),
@@ -19507,6 +19914,11 @@ def run_agent_subprocess(configuration):
                          'user_observed_action_samples': sum(agent.brain.game.user_action_samples) if agent.brain is not None else 0,
                          'user_observed_action_types': sum(1 for value in agent.brain.game.user_action_samples if value > 0) if agent.brain is not None else 0,
                          'learning_activity': agent.learning_activity,
+                         'blackbox_request_id': blackbox_request_state.get('id'),
+                         'blackbox_in_progress': bool(blackbox_thread is not None and blackbox_thread.is_alive()),
+                         'blackbox_elapsed_seconds': (max(0.0, now - blackbox_started)
+                                                      if blackbox_started is not None and blackbox_thread is not None
+                                                      and blackbox_thread.is_alive() else 0.0),
                          'background_process_priority_applied': agent.background_priority_applied,
                          'training_thread_priority_applied': agent.brain.training_priority_applied if agent.brain is not None else None,
                          'training_heartbeat_age': max(0.0, now - agent.brain.training_last_tick)
@@ -19528,7 +19940,7 @@ def run_agent_subprocess(configuration):
                     os.replace(temporary, path)
                 except OSError:
                     pass
-                if shutdown_complete.is_set():
+                if shutdown_complete.is_set() and not (blackbox_thread is not None and blackbox_thread.is_alive()):
                     break
                 heartbeat_exit.wait(heartbeat_interval)
         heart = threading.Thread(target=publish_heartbeat, name='AgentExecutionHeartbeat', daemon=True)
@@ -19917,10 +20329,15 @@ class App:
             self.set_status('验证经验存储')
             try:
                 store = ReplayStore(self.folder)
-            except sqlite3.DatabaseError as exc:
-                if not quarantine_corrupt_store(self.folder, exc):
-                    raise
-                store = ReplayStore(self.folder)
+            except (sqlite3.DatabaseError, ValueError) as exc:
+                if quarantine_corrupt_store(self.folder, exc):
+                    store = ReplayStore(self.folder)
+                else:
+                    archived = archive_incompatible_store(self.folder, exc)
+                    if archived is None:
+                        raise
+                    self.runtime_profile['incompatible_experience_store_preserved'] = archived.name
+                    store = ReplayStore(self.folder)
             try:
                 if not store.verify_roundtrip():
                     raise sqlite3.DatabaseError('经验存储验证失败')
@@ -19933,7 +20350,8 @@ class App:
                     performance = profile_runtime(self.folder, self.numpy, capture_ms, stop_vk, (frame, rect))
                     self.runtime_profile['performance'] = performance
                     self.runtime_profile['performance_profile_verified'] = bool(
-                        performance.get('complete_plan_p95_milliseconds') is not None
+                        performance.get('complete_plan_max_milliseconds') is not None
+                        and performance.get('complete_plan_sample_count', 0) > 0
                         and performance.get('estimated_single_decision_milliseconds') is not None)
                 except BaseException as exc:
                     self.runtime_profile['performance_profile_verified'] = False
@@ -20186,6 +20604,7 @@ class App:
                     previous_actions = None
                     previous_learning = None
                     previous_phase = None
+                    previous_learning_activity = None
                     last_sensor_progress = born
                     last_input_progress = born
                     last_learning_progress = born
@@ -20234,6 +20653,15 @@ class App:
                         now = time.monotonic()
                         if snapshot is not None:
                             phase = str(snapshot.get('phase') or '')
+                            learning_activity = str(snapshot.get('learning_activity') or '')
+                            if self.process_operation == 'cultivate' and learning_activity != previous_learning_activity:
+                                if learning_activity == 'waiting_for_saved_experience':
+                                    self.set_status('等待已有游戏经验；按停止键结束')
+                                elif learning_activity == 'training_saved_experience':
+                                    self.set_status('正在使用已有游戏经验训练；按停止键结束')
+                                elif learning_activity:
+                                    self.set_status('Agent 学习运行中；按停止键结束')
+                                previous_learning_activity = learning_activity
                             if phase != previous_phase:
                                 if phase == 'acting':
                                     last_input_progress = now
@@ -20377,7 +20805,15 @@ class App:
                 pass
         storage_estimate = storage_cost * pending_batches
         estimate = max(values + stage_seconds + [storage_estimate, 0.0])
-        return max(15.0, min(120.0, 15.0 + estimate * 4.0))
+        grace = max(15.0, min(120.0, 15.0 + estimate * 4.0))
+        if snapshot.get('blackbox_in_progress'):
+            try:
+                elapsed = max(0.0, float(snapshot.get('blackbox_elapsed_seconds') or 0.0))
+                interval = max(0.1, float(snapshot.get('heartbeat_interval_seconds') or 2.0))
+                grace = max(grace, elapsed + interval * 2.0)
+            except (TypeError, ValueError, OverflowError):
+                pass
+        return grace
 
     def repair_release(self, control):
         attempts = 0
@@ -20422,12 +20858,100 @@ class App:
 
     def export_blackbox_worker(self, folder, stop_vk, window_identity, mode='窗口', operation=None):
         com_ready = self.n.ole.CoInitializeEx(None, 2) in (0, 1)
+        folder = pathlib.Path(folder)
+        request_path = folder / 'blackbox_request.json'
+        result_path = folder / 'blackbox_result.json'
+        request_temp = None
+        request_id = None
+        request_written = False
         try:
+            process = self.worker_process if self.running else None
+            session = self.process_session if self.running else None
+            if process is not None and process.poll() is None and isinstance(session, str):
+                request_id = uuid.uuid4().hex
+                request_temp = folder / ('blackbox_request_' + request_id + '.tmp')
+                result_path.unlink(missing_ok=True)
+                with request_temp.open('w', encoding='utf-8') as stream:
+                    json.dump({'request_id': request_id, 'session': session},
+                              stream, ensure_ascii=False, separators=(',', ':'), allow_nan=False)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(request_temp, request_path)
+                request_written = True
+                request_started = time.monotonic()
+                heartbeat_missing_since = None
+                heartbeat_interval = 2.0
+                worker_result = None
+                while True:
+                    if result_path.is_file() and result_path.stat().st_size <= 4096:
+                        try:
+                            candidate = json.loads(result_path.read_text(encoding='utf-8'))
+                        except (OSError, ValueError, TypeError):
+                            candidate = None
+                        if isinstance(candidate, dict) and candidate.get('request_id') == request_id:
+                            worker_result = candidate
+                            break
+                    if process.poll() is not None:
+                        break
+                    snapshot = worker_progress_snapshot(folder, session, process)
+                    if snapshot is None:
+                        if heartbeat_missing_since is None:
+                            heartbeat_missing_since = time.monotonic()
+                        elif time.monotonic() - heartbeat_missing_since > heartbeat_interval * 4.0:
+                            break
+                    else:
+                        heartbeat_missing_since = None
+                        try:
+                            heartbeat_interval = max(0.1, float(snapshot.get('heartbeat_interval_seconds') or heartbeat_interval))
+                        except (TypeError, ValueError, OverflowError):
+                            pass
+                        if snapshot.get('blackbox_request_id') == request_id:
+                            if not snapshot.get('blackbox_in_progress'):
+                                time.sleep(min(heartbeat_interval, 0.2))
+                                if result_path.is_file():
+                                    continue
+                                break
+                        elif time.monotonic() - request_started > heartbeat_interval * 4.0:
+                            break
+                    time.sleep(0.1)
+                if worker_result is not None:
+                    if not worker_result.get('ok'):
+                        raise RuntimeError(worker_result.get('error') or '执行进程生成黑匣子失败')
+                    name = worker_result.get('name')
+                    if not isinstance(name, str) or pathlib.Path(name).name != name:
+                        raise OSError('执行进程返回了无效的黑匣子文件名')
+                    path = pathlib.Path(self.n.desktop()) / name
+                    size = int(worker_result.get('size') or -1)
+                    if not path.is_file() or path.stat().st_size != size or size > 1_000_000:
+                        raise OSError('黑匣子文件未通过完整性或容量检查')
+                    self.set_status(f'已保存：{path.name} · {size} B')
+                    return
+                request_path.unlink(missing_ok=True)
+                request_written = False
             path = blackbox(self.n, folder, None, mode, stop_vk, window_identity, operation)
-            self.set_status(f'已保存：{path.name} · {path.stat().st_size} B')
+            size = int(path.stat().st_size)
+            if size > 1_000_000:
+                raise OSError('黑匣子超过 1MB，未交付')
+            self.set_status(f'已保存：{path.name} · {size} B')
         except BaseException as exc:
             self.set_status(f'生成失败：{str(exc)[:170]}')
         finally:
+            if request_temp is not None:
+                request_temp.unlink(missing_ok=True)
+            if request_written and request_path.is_file():
+                try:
+                    current = json.loads(request_path.read_text(encoding='utf-8'))
+                    if isinstance(current, dict) and current.get('request_id') == request_id:
+                        request_path.unlink(missing_ok=True)
+                except (OSError, ValueError, TypeError):
+                    pass
+            if request_id is not None and result_path.is_file():
+                try:
+                    current = json.loads(result_path.read_text(encoding='utf-8'))
+                    if isinstance(current, dict) and current.get('request_id') == request_id:
+                        result_path.unlink(missing_ok=True)
+                except (OSError, ValueError, TypeError):
+                    pass
             if com_ready:
                 self.n.ole.CoUninitialize()
             self.blackbox_busy = False
@@ -20575,22 +21099,50 @@ class App:
                 self.n.ole.CoUninitialize()
 
 
-def main():
-    if os.name != 'nt':
-        raise SystemExit('本程序需要 Windows 11 x64。')
-    if sys.version_info < (3, 8):
-        raise SystemExit('本程序需要 Python 3.8 或更高版本。')
-    if ctypes.sizeof(ctypes.c_void_p) != 8:
-        raise SystemExit('本程序需要 64 位 Python。')
-    windows_version = sys.getwindowsversion()
-    if windows_version.major != 10 or windows_version.build < 22000:
-        raise SystemExit('本程序需要 Windows 11 x64。')
+def show_startup_error(message):
+    text = str(message)[:3000]
+    if os.name == 'nt':
+        try:
+            user = ctypes.WinDLL('user32', use_last_error=True)
+            function = user.MessageBoxW
+            function.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint]
+            function.restype = ctypes.c_int
+            function(None, text, '游戏 Agent 启动失败', 0x10)
+            return
+        except Exception:
+            pass
     try:
-        ctypes.WinDLL('kernel32').FreeConsole()
+        sys.stderr.write(text + os.linesep)
+        sys.stderr.flush()
     except Exception:
         pass
-    enable_dpi_awareness()
-    App().loop()
+
+
+def main():
+    try:
+        if os.name != 'nt':
+            raise RuntimeError('本程序需要 Windows 11 x64。')
+        if sys.version_info < (3, 8):
+            raise RuntimeError('本程序需要 Python 3.8 或更高版本。')
+        if ctypes.sizeof(ctypes.c_void_p) != 8:
+            raise RuntimeError('本程序需要 64 位 Python。')
+        windows_version = sys.getwindowsversion()
+        if windows_version.major != 10 or windows_version.build < 22000:
+            raise RuntimeError('本程序需要 Windows 11 x64。')
+        architecture = native_windows_architecture()
+        if architecture != 9:
+            raise RuntimeError(f'本程序需要原生 AMD64/x64 Windows，当前系统架构代码为 {architecture}。')
+        enable_dpi_awareness()
+        try:
+            ctypes.WinDLL('kernel32', use_last_error=True).FreeConsole()
+        except Exception:
+            pass
+        App().loop()
+    except KeyboardInterrupt:
+        raise
+    except BaseException as exc:
+        show_startup_error(f'{type(exc).__name__}: {exc}')
+        raise SystemExit(1)
 
 
 if __name__ == '__main__':
